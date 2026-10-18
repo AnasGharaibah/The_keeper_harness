@@ -338,8 +338,28 @@ class _HarnessGameSession:
             if run.solver_note is None:
                 run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
+            self._finalize_analyzer()
             self.state_path.unlink(missing_ok=True)
             self._write_analysis_html()
+            self.write_viewer_payload()
+
+    def _finalize_analyzer(self) -> None:
+        """Run-end level review (optional layer). Runs after the game is finished, so
+        it never affects TAAF scoring; the LLM part is skipped when stopping or out
+        of per-game time."""
+        finalize = getattr(self.analyzer, "finalize", None)
+        if not callable(finalize):
+            return
+        allow_llm = not self.stop_event.is_set() and not self.runtime_limit_reached()
+        try:
+            finalize(
+                self.state_path,
+                request_timeout_seconds=self.request_timeout_seconds(),
+                allow_llm=allow_llm,
+            )
+        except Exception:
+            return
+        if self._append_layer_viewer_events(self.analysis_step):
             self.write_viewer_payload()
 
     def _finish_if_needed(self) -> None:
@@ -690,6 +710,21 @@ class _HarnessGameSession:
             bool(item.get("board_changed")) for item in executed_payloads
         )
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
+        final_payload["per_action"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "action_num",
+                    "action_display",
+                    "board_changed",
+                    "level_completed",
+                    "game_over",
+                    "run_complete",
+                    "reward",
+                )
+            }
+            for item in executed_payloads
+        ]
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
         if expect is not None:

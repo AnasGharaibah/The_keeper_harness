@@ -107,6 +107,12 @@ PREDICTION_CHECK_ADDENDUM = (
     "- The harness checks it against the real result and reports `confirmed` or `WRONG` with the exact diff in the tool result's `prediction_check`, in `last_prediction`, and in `prediction_log`. WRONG means your model of that action is wrong: revise it before relying on it.\n"
 )
 
+LEVEL_REVIEW_ADDENDUM = (
+    "\n\nRules and goals memory:\n"
+    "- Record a claimed rule or goal from Python with `hypothesis(text, kind='rule' or 'goal', check_code=None)`. `check_code` is Python source defining `check_transition(t)` that returns True (claim held), False (violated) or None (does not apply) for one transition `t` (`t.action`, `t.before_frame`, `t.after_frame`, `t.result`). Helpers: `cell(frame, row, col)`, `changed_cells(a, b)` -> [(row, col, old, new)], `parse_action(t.action)` -> (name, row, col).\n"
+    "- After each level the harness runs every check on all of that level's transitions. A claim becomes a VERIFIED FACT only if its check passes, applies to enough transitions, and fails on harness-perturbed transitions. Facts stay pinned at the top of your context across levels; facts that later fail move to REFUTED.\n"
+)
+
 COMPACT_TOOL_SESSION_ADDENDUM = (
     "\n\nTool session rules:\n"
     "- You have exactly one tool: `python`.\n"

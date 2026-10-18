@@ -14,7 +14,8 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
-from inference.agent.layer_config import PredictionCheckConfig
+from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig
+from inference.agent.level_memory import LevelMemory
 from inference.agent.prediction import (
     VERDICT_WRONG,
     prediction_counts,
@@ -24,6 +25,7 @@ from inference.agent.prediction import (
 from inference.agent.prompts import (
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
+    LEVEL_REVIEW_ADDENDUM,
     PREDICTION_CHECK_ADDENDUM,
     PYTHON_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
@@ -37,7 +39,7 @@ from inference.agent.vision_context import (
     current_grid_image_part,
 )
 
-from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.python_tool_sandbox import run_sandboxed_check, run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import build_chat_payload, build_headers
 
@@ -174,6 +176,10 @@ _PYTHON_TOOL_DESCRIPTION = (
 _PYTHON_TOOL_PREDICTION_DESCRIPTION = (
     " Pass `expect={...}` to `action(...)` to have the harness check your predicted effect "
     "(`last_prediction`, `prediction_log`)."
+)
+_PYTHON_TOOL_REVIEW_DESCRIPTION = (
+    " Call `hypothesis(text, kind='rule'|'goal', check_code=None)` to record a claim the harness "
+    "verifies after the level."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -359,7 +365,12 @@ def _format_model_response_meta(
     return "\n".join(lines)
 
 
-def _build_system_prompt(*, tool_output_tokens: int, prediction_check: bool = False) -> str:
+def _build_system_prompt(
+    *,
+    tool_output_tokens: int,
+    prediction_check: bool = False,
+    level_review: bool = False,
+) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
@@ -369,6 +380,8 @@ def _build_system_prompt(*, tool_output_tokens: int, prediction_check: bool = Fa
     prompt += PYTHON_ADDENDUM
     if prediction_check:
         prompt += PREDICTION_CHECK_ADDENDUM
+    if level_review:
+        prompt += LEVEL_REVIEW_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
     return prompt
 
@@ -783,6 +796,14 @@ def _resolve_prompt_log_path(state_path: Path) -> Path:
     )
 
 
+def _facts_path(state_path: Path) -> Path:
+    """``artifacts/<game>_p<N>_tool_runtime_state.json`` -> ``artifacts/<game>_p<N>_facts.json``."""
+    suffix = f"_{RUNTIME_STATE_FILENAME}"
+    if state_path.name.endswith(suffix):
+        return state_path.with_name(f"{state_path.name[: -len(suffix)]}_facts.json")
+    return state_path.parent / "facts.json"
+
+
 def _resolve_request_log_path(state_path: Path) -> Path:
     return _resolve_named_run_artifact(
         state_path,
@@ -928,6 +949,7 @@ class ToolAgent:
         base_url: str | None = None,
         provider: str | None = None,
         prediction_check: PredictionCheckConfig | None = None,
+        level_review: LevelReviewConfig | None = None,
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
@@ -954,13 +976,18 @@ class ToolAgent:
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
         self._prediction_config = prediction_check or PredictionCheckConfig.from_env()
+        self._review_config = level_review or LevelReviewConfig.from_env()
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
             prediction_check=self._prediction_config.enabled,
+            level_review=self._review_config.enabled,
         )
-        self._tool_description = _PYTHON_TOOL_DESCRIPTION + (
-            _PYTHON_TOOL_PREDICTION_DESCRIPTION if self._prediction_config.enabled else ""
+        self._tool_description = (
+            _PYTHON_TOOL_DESCRIPTION
+            + (_PYTHON_TOOL_PREDICTION_DESCRIPTION if self._prediction_config.enabled else "")
+            + (_PYTHON_TOOL_REVIEW_DESCRIPTION if self._review_config.enabled else "")
         )
+        self._level_memory: LevelMemory | None = None
         # One entry per executed action(...) call (all levels), plus viewer events
         # buffered for the solver to drain after each turn.
         self._prediction_entries: list[dict[str, Any]] = []
@@ -1008,21 +1035,125 @@ class ToolAgent:
             self._summarized_knowledge = _empty_world_model()
             self._prediction_entries = []
             self._layer_events = []
+            self._level_memory = (
+                LevelMemory(self._review_config, facts_path=_facts_path(state_path))
+                if self._review_config.enabled
+                else None
+            )
 
     def drain_layer_events(self) -> list[dict[str, Any]]:
         """Return and clear viewer events buffered by the optional layers."""
         events, self._layer_events = self._layer_events, []
         return events
 
-    def _sandbox_prediction_state(self, level: int | None) -> dict[str, Any]:
-        if not self._prediction_config.enabled:
-            return {}
-        entries = [entry for entry in self._prediction_entries if level is None or entry.get("level") == level]
-        size = self._prediction_config.sandbox_log_size
-        return {
-            "last_prediction": self._prediction_entries[-1] if self._prediction_entries else None,
-            "prediction_log": entries[-size:] if size > 0 else [],
-        }
+    def _system_message_content(self) -> str:
+        """System prompt plus the pinned VERIFIED FACTS block. The system message is
+        ``messages[0]``, which context trimming never evicts, so the block is pinned."""
+        if self._level_memory is None:
+            return self._system_prompt
+        block = self._level_memory.render_pinned_block()
+        return f"{self._system_prompt}\n\n{block}" if block else self._system_prompt
+
+    def _initial_messages(self, user_message: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": self._system_message_content()},
+            *self._history_messages,
+            user_message,
+        ]
+
+    def _run_review_check(
+        self,
+        check_code: str,
+        transitions: list[dict[str, Any]],
+        alt_actions: list[str],
+        perturb: bool,
+    ) -> dict[str, Any]:
+        return run_sandboxed_check(
+            check_code=check_code,
+            transitions=transitions,
+            timeout_seconds=self._review_config.check_timeout_seconds,
+            alt_actions=alt_actions,
+            perturb=perturb,
+        )
+
+    def _review_llm_call(self, messages: list[dict[str, Any]], timeout_seconds: float) -> str:
+        result = self._chat_completion(
+            messages,
+            tools=None,
+            request_timeout_seconds=max(1.0, float(timeout_seconds)),
+            max_tokens=self._review_config.max_review_tokens,
+            thinking=self._review_config.review_thinking,
+        )
+        self._accumulate_usage_tokens(result.usage)
+        content = _normalize_message_content(result.message.get("content", ""))
+        return content or _extract_reasoning_text(result.message)
+
+    def _run_pending_reviews(
+        self,
+        state_path: Path,
+        *,
+        time_cap_seconds: float | None,
+        allow_llm: bool = True,
+    ) -> list[str]:
+        """Run queued level reviews; returns one-shot notices for the next user prompt."""
+        memory = self._level_memory
+        if memory is None or not memory.has_pending():
+            return []
+        budget = self._review_config.review_time_budget_seconds
+        if time_cap_seconds is not None:
+            budget = min(budget, max(0.0, float(time_cap_seconds)))
+        llm_call = self._review_llm_call if (self._review_config.llm_review and allow_llm) else None
+        try:
+            _frame, history = load_runtime_state(state_path)
+            summaries = memory.run_pending_reviews(
+                history=history,
+                prediction_entries=self._prediction_entries,
+                check_runner=self._run_review_check,
+                llm_call=llm_call,
+                time_budget_seconds=budget,
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken review must never stop play
+            log.warning("level review failed: %s", exc)
+            return [f"LEVEL REVIEW failed: {type(exc).__name__}; facts unchanged."]
+        for summary in summaries:
+            self._layer_events.append({"type": "level_review", **summary})
+        return memory.pop_notices()
+
+    def finalize(
+        self,
+        state_path: Path,
+        *,
+        request_timeout_seconds: float | None = None,
+        allow_llm: bool = True,
+    ) -> None:
+        """Run-end hook (called by the solver before it deletes the runtime state):
+        review the level in progress and persist facts."""
+        memory = self._level_memory
+        if memory is None or not state_path.exists():
+            return
+        current_frame, _history = load_runtime_state(state_path)
+        if not memory.has_pending() and current_frame is not None:
+            memory.mark_review_pending(current_frame.level, "run_end")
+        self._run_pending_reviews(
+            state_path,
+            time_cap_seconds=request_timeout_seconds,
+            allow_llm=allow_llm,
+        )
+        memory.save()
+
+    def _sandbox_layer_state(self, level: int | None) -> dict[str, Any]:
+        """Extra state keys for the sandbox; empty when both layers are off."""
+        state: dict[str, Any] = {}
+        if self._prediction_config.enabled:
+            entries = [entry for entry in self._prediction_entries if level is None or entry.get("level") == level]
+            size = self._prediction_config.sandbox_log_size
+            state["last_prediction"] = self._prediction_entries[-1] if self._prediction_entries else None
+            state["prediction_log"] = entries[-size:] if size > 0 else []
+        if self._level_memory is not None:
+            state["next_hypothesis_index"] = self._level_memory.next_index
+            state["quick_check_seconds"] = self._review_config.quick_check_seconds
+            state["transition_results"] = self._level_memory.transition_results_payload()
+        return state
 
     @property
     def total_tokens(self) -> int:
@@ -1326,16 +1457,18 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None,
         request_timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
+        thinking: bool | None = None,
     ) -> _ChatCompletionResult:
         payload = build_chat_payload(
             provider=self._model.provider,
             model=self._model.model_id,
             messages=messages,
-            max_tokens=self._max_output_tokens,
+            max_tokens=max_tokens if max_tokens is not None else self._max_output_tokens,
             temperature=_LOCAL_ANALYZER_TEMPERATURE,
             top_p=_LOCAL_ANALYZER_TOP_P,
             top_k=_LOCAL_ANALYZER_TOP_K,
-            thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
+            thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING) if thinking is None else bool(thinking),
             tools=tools,
             tool_choice=_request_tool_choice(tools),
             seed=_LOCAL_ANALYZER_SEED,
@@ -1529,7 +1662,7 @@ class ToolAgent:
                     if isinstance(persisted_action_result, dict)
                     else {}
                 ),
-                **self._sandbox_prediction_state(
+                **self._sandbox_layer_state(
                     refreshed_frame.level if refreshed_frame is not None else None
                 ),
             }
@@ -1542,15 +1675,15 @@ class ToolAgent:
             compact_payload: dict[str, Any],
             raw_payload: dict[str, Any],
             expect: Any,
+            level: int | None,
         ) -> None:
-            nonlocal current_level
             prediction = raw_payload.get("prediction")
             if not isinstance(prediction, dict):
                 prediction = unchecked_prediction()
             entry: dict[str, Any] = {
                 "action_num": compact_payload.get("action_num"),
                 "actions": list(compact_payload.get("executed_actions") or []),
-                "level": current_level,
+                "level": level,
                 **prediction,
             }
             if expect is not None:
@@ -1562,13 +1695,9 @@ class ToolAgent:
                 for key in ("verdict", "failures", "skipped", "note")
                 if prediction.get(key)
             }
-            try:
-                current_level = int(compact_payload.get("level"))
-            except (TypeError, ValueError):
-                pass
 
         def _handle_action(actions: list[dict[str, Any]], expect: Any = None) -> dict[str, Any]:
-            nonlocal terminal_action_result
+            nonlocal terminal_action_result, current_level
             if self._step_env_callback is None:
                 raise RuntimeError("action(actions) is not available in this session.")
             normalized_actions = self._normalize_python_actions(actions)
@@ -1608,12 +1737,24 @@ class ToolAgent:
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             compact_payload = self._compact_action_result(raw_payload)
-            if self._prediction_config.enabled and compact_payload.get("executed"):
-                _record_prediction(
-                    compact_payload,
-                    raw_payload,
-                    step_arguments.get("expect"),
-                )
+            if compact_payload.get("executed"):
+                level_before = current_level
+                if self._prediction_config.enabled:
+                    _record_prediction(
+                        compact_payload,
+                        raw_payload,
+                        step_arguments.get("expect"),
+                        level_before,
+                    )
+                if self._level_memory is not None:
+                    self._level_memory.record_transition_results(raw_payload.get("per_action"))
+                    end_reason = _terminal_action_reason(compact_payload)
+                    if end_reason in {"level_completed", "game_over", "run_complete"}:
+                        self._level_memory.mark_review_pending(level_before, end_reason)
+                try:
+                    current_level = int(compact_payload.get("level"))
+                except (TypeError, ValueError):
+                    pass
             next_valid_actions = raw_payload.get("valid_actions")
             if isinstance(next_valid_actions, list):
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
@@ -1678,6 +1819,14 @@ class ToolAgent:
                     ][: self._prediction_config.max_wrong_diffs_shown],
                 }
             )
+        if self._level_memory is not None and sandbox_result.get("hypotheses"):
+            recorded = self._level_memory.add_hypotheses(
+                sandbox_result.get("hypotheses"),
+                default_level=current_frame.level if current_frame is not None else None,
+            )
+            if recorded:
+                payload["hypotheses_recorded"] = recorded
+            self._level_memory.save()
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
         if step_executed:
@@ -1824,6 +1973,10 @@ class ToolAgent:
 
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
+        review_notices = self._run_pending_reviews(
+            state_path,
+            time_cap_seconds=request_timeout_seconds,
+        )
         current_frame, history_entries = load_runtime_state(state_path)
         user_prompt = self._build_user_prompt(
             action_num,
@@ -1832,6 +1985,8 @@ class ToolAgent:
             history_entries=history_entries,
             previous_step_summary=self._last_step_summary,
         )
+        if review_notices:
+            user_prompt = "\n".join([*review_notices, "", user_prompt])
         display_action_num = _display_action_number(action_num)
 
         with open(analyzer_log, "a", encoding="utf-8") as f:
@@ -1849,13 +2004,15 @@ class ToolAgent:
             if transcript_updated is not None:
                 transcript_updated("".join(transcript_parts))
 
-        append_transcript("SYSTEM PROMPT", self._system_prompt)
+        append_transcript("SYSTEM PROMPT", self._system_message_content())
+        if review_notices:
+            append_transcript("LEVEL REVIEW", "\n".join(review_notices))
         append_transcript("USER PROMPT", user_prompt)
 
         previous_history_messages = list(self._history_messages)
         preserve_history = True
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
-            [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
+            self._initial_messages(self._build_user_message(user_prompt, current_frame)),
             tools=self._tools(state_path),
             preserve_recent=1,
         )

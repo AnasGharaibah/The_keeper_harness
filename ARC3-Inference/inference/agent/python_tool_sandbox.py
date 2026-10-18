@@ -25,7 +25,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import io
     import json
     import os
+    import signal
     import sys
+    import time
     import traceback
 
     try:
@@ -136,7 +138,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         @property
         def segmentation(self):
             if self._segmentation is None:
-                self._segmentation = segment_layer(self._grid, COLOR_CHARS)
+                grid = self._grid
+                if grid is None:  # check mode ships compact row strings, not int grids
+                    grid = [[max(0, COLOR_CHARS.find(ch)) for ch in line] for line in self.ascii.split("\n")]
+                self._segmentation = segment_layer(grid, COLOR_CHARS)
             return self._segmentation
 
         def __str__(self):
@@ -323,6 +328,197 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return _json_safe(normalized)
 
 
+    def cell(frame, row, col):
+        if frame is None:
+            return None
+        lines = frame.ascii.split("\n")
+        if 0 <= row < len(lines) and 0 <= col < len(lines[row]):
+            return lines[row][col]
+        return None
+
+
+    def changed_cells(before, after):
+        if before is None or after is None:
+            return []
+        a_lines = before.ascii.split("\n")
+        b_lines = after.ascii.split("\n")
+        changes = []
+        for r in range(min(len(a_lines), len(b_lines))):
+            a_row, b_row = a_lines[r], b_lines[r]
+            for c in range(min(len(a_row), len(b_row))):
+                if a_row[c] != b_row[c]:
+                    changes.append((r, c, a_row[c], b_row[c]))
+        return changes
+
+
+    def parse_action(text):
+        text = str(text or "").strip()
+        name = text.split("(", 1)[0].strip().upper()
+        row = col = None
+        if "(" in text:
+            for part in text.split("(", 1)[1].rstrip(")").split(","):
+                key, _, value = part.partition("=")
+                try:
+                    if key.strip() == "row":
+                        row = int(value)
+                    elif key.strip() == "col":
+                        col = int(value)
+                except ValueError:
+                    pass
+        return name, row, col
+
+
+    class _CheckTimeout(BaseException):
+        pass
+
+
+    _PERTURB_LIMIT = 50
+    _DEFAULT_ALT_ACTIONS = ["UP", "DOWN", "LEFT", "RIGHT", "SPACE"]
+
+
+    def _load_check(check_code):
+        safe_builtins = {name: getattr(builtins, name) for name in SAFE_BUILTINS}
+        safe_builtins["__import__"] = _safe_import
+        namespace = {
+            "__builtins__": safe_builtins,
+            "cell": cell,
+            "changed_cells": changed_cells,
+            "parse_action": parse_action,
+        }
+        exec(compile(str(check_code or ""), "<check>", "exec"), namespace)
+        if callable(namespace.get("check_transition")):
+            return "each", namespace["check_transition"]
+        if callable(namespace.get("check")):
+            return "all", namespace["check"]
+        raise ValueError("check_code must define check_transition(t) or check(transitions).")
+
+
+    def _tri(value):
+        return None if value is None else bool(value)
+
+
+    def _outcomes(form, fn, transitions):
+        if form == "each":
+            return [_tri(fn(t)) for t in transitions]
+        value = fn(list(transitions))
+        if isinstance(value, (list, tuple)):
+            return [_tri(item) for item in value]
+        return [_tri(value)]
+
+
+    def _perturbed(transition, kind, alt_actions):
+        result = dict(transition.result)
+        action = transition.action
+        after = transition.after_frame
+        if kind == "frozen":
+            after = transition.before_frame
+            result.update({"board_changed": False, "level_completed": False})
+        elif kind == "swapped":
+            base = parse_action(action)[0]
+            action = next(
+                (alt for alt in list(alt_actions) + _DEFAULT_ALT_ACTIONS if parse_action(alt)[0] != base),
+                action,
+            )
+        elif kind == "flipped":
+            for key in ("board_changed", "level_completed", "game_over"):
+                result[key] = not bool(result.get(key))
+        return TransitionView(
+            action=action,
+            before_frame=transition.before_frame,
+            after_frame=after,
+            result=result,
+        )
+
+
+    def _evaluate_check_inner(check_code, transitions, alt_actions, perturb):
+        form, fn = _load_check(check_code)
+        outcomes = _outcomes(form, fn, transitions)
+        report = {
+            "status": "pass",
+            "form": form,
+            "support": sum(1 for item in outcomes if item is True),
+            "failures": sum(1 for item in outcomes if item is False),
+            "not_applicable": sum(1 for item in outcomes if item is None),
+            "falsifiable": None,
+        }
+        if report["failures"]:
+            report["status"] = "fail"
+            index = outcomes.index(False)
+            if form == "each" or len(outcomes) == len(transitions):
+                failed = transitions[index] if index < len(transitions) else None
+                if failed is not None:
+                    report["first_failure"] = {
+                        "action": failed.action,
+                        "step": failed.after_frame.step if failed.after_frame is not None else None,
+                    }
+            return report
+        if report["support"] == 0:
+            report["status"] = "not_applicable"
+            return report
+        if not perturb:
+            return report
+        if form == "each":
+            applied = [t for t, item in zip(transitions, outcomes) if item is True][:_PERTURB_LIMIT]
+        else:
+            applied = list(transitions)
+        falsifiable = False
+        for kind in ("frozen", "swapped", "flipped"):
+            variants = [_perturbed(t, kind, alt_actions) for t in applied]
+            try:
+                rejected = False in _outcomes(form, fn, variants)
+            except Exception:
+                rejected = True  # crashing on a perturbed transition also discriminates
+            if rejected:
+                falsifiable = True
+                break
+        report["falsifiable"] = falsifiable
+        return report
+
+
+    def _evaluate_check(check_code, transitions, alt_actions=(), perturb=True, time_limit=None):
+        if time_limit is not None and time_limit <= 0:
+            return {"status": "skipped", "error": "quick-check time budget used up"}
+        use_timer = time_limit is not None and hasattr(signal, "setitimer")
+        previous_handler = None
+        if use_timer:
+
+            def _on_alarm(signum, frame):
+                raise _CheckTimeout()
+
+            previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, float(time_limit))
+        try:
+            return _evaluate_check_inner(check_code, transitions, alt_actions, perturb)
+        except _CheckTimeout:
+            return {"status": "skipped", "error": f"quick check exceeded its {float(time_limit):.1f}s budget"}
+        except Exception as exc:
+            return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+        finally:
+            if use_timer:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+
+
+    def _frame_from_rows(rows, step, level):
+        rows = [str(row) for row in rows or []]
+        return FrameView(
+            ascii="\n".join(rows),
+            step=int(step or 0),
+            level=int(level or 0),
+            shape=[len(rows), len(rows[0]) if rows else 0],
+            grid=None,
+        )
+
+
+    def _transition_from_check_payload(payload):
+        return TransitionView(
+            action=str(payload.get("action", "")),
+            before_frame=_frame_from_rows(payload.get("before"), payload.get("before_step"), payload.get("before_level")),
+            after_frame=_frame_from_rows(payload.get("after"), payload.get("step"), payload.get("level")),
+            result=payload.get("result") or {},
+        )
+
+
     def main():
         initial = _recv()
         global COLOR_CHARS
@@ -332,6 +528,21 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         if sandbox_cwd:
             os.chdir(sandbox_cwd)
         _set_limits(timeout_seconds)
+
+        if initial.get("mode") == "check":
+            check_transitions = [
+                _transition_from_check_payload(item)
+                for item in initial.get("transitions") or []
+                if isinstance(item, dict)
+            ]
+            outcome = _evaluate_check(
+                initial.get("check_code", ""),
+                check_transitions,
+                alt_actions=[str(item) for item in initial.get("alt_actions") or []],
+                perturb=bool(initial.get("perturb", True)),
+            )
+            _send({"type": "final", "stdout": "", "result": _json_safe(outcome), "action_results": []})
+            return
 
         action_results = []
         stdout = io.StringIO()
@@ -352,6 +563,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 dict(last_action_result) if isinstance(last_action_result, dict) else {}
             )
             transitions = _transitions_from_history(history, action_result)
+            transition_results = state_payload.get("transition_results")
+            if isinstance(transition_results, dict):
+                for transition in transitions:
+                    stored = transition_results.get(str(transition.after_frame.step)) if transition.after_frame else None
+                    if not transition.result and isinstance(stored, dict):
+                        transition.result = dict(stored)
             last_transition = transitions[-1] if transitions else None
 
             runtime_globals["current_frame"] = current_frame
@@ -391,7 +608,52 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             _refresh_state(reply.get("state") or {})
             return action_result
 
+        hypotheses = []
+        initial_state = initial.get("state") or {}
+        next_hypothesis_index = int(initial_state.get("next_hypothesis_index") or 1)
+        quick_budget = [float(initial_state.get("quick_check_seconds") or 0.0)]
+
+        def hypothesis(text, kind="rule", check_code=None):
+            text = " ".join(str(text or "").split())
+            if not text:
+                raise ValueError("hypothesis(text) needs a non-empty claim.")
+            kind = str(kind or "rule").strip().lower()
+            if kind not in ("rule", "goal"):
+                raise ValueError("hypothesis kind must be 'rule' or 'goal'.")
+            if check_code is not None and not isinstance(check_code, str):
+                raise TypeError("check_code must be a string of Python source.")
+            frame = runtime_globals.get("current_frame")
+            level = frame.level if frame is not None else 0
+            record = {
+                "id": f"H{next_hypothesis_index + len(hypotheses)}",
+                "text": text[:400],
+                "kind": kind,
+                "check_code": check_code or None,
+                "level": level,
+            }
+            reply = {"id": record["id"], "recorded": True}
+            if check_code:
+                level_transitions = [
+                    t
+                    for t in runtime_globals.get("transitions") or []
+                    if t.before_frame is not None
+                    and t.before_frame.level == level
+                    and parse_action(t.action)[0] != "RESET"
+                ]
+                started = time.monotonic()
+                reply["quick_check"] = _evaluate_check(
+                    check_code, level_transitions, perturb=False, time_limit=quick_budget[0]
+                )
+                quick_budget[0] -= time.monotonic() - started
+                record["quick_check"] = reply["quick_check"]
+            hypotheses.append(record)
+            return reply
+
         runtime_globals["action"] = action
+        runtime_globals["hypothesis"] = hypothesis
+        runtime_globals["cell"] = cell
+        runtime_globals["changed_cells"] = changed_cells
+        runtime_globals["parse_action"] = parse_action
         _refresh_state(initial.get("state") or {})
 
         try:
@@ -404,6 +666,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "stdout": stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
+                    "hypotheses": _json_safe(hypotheses),
                 }
             )
         except Exception as exc:
@@ -413,6 +676,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "error": _sanitize_exception(exc),
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
+                    "hypotheses": _json_safe(hypotheses),
                 }
             )
 
@@ -475,7 +739,8 @@ def run_sandboxed_python(
     code: str,
     timeout_seconds: int,
     initial_state: dict[str, Any],
-    action_handler: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    action_handler: Callable[..., dict[str, Any]],
+    extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
@@ -513,6 +778,7 @@ def run_sandboxed_python(
         _send_json_line(
             process.stdin,
             {
+                **(extra_payload or {}),
                 "code": code,
                 "timeout_seconds": timeout_seconds,
                 "sandbox_cwd": sandbox_dir,
@@ -597,6 +863,7 @@ def run_sandboxed_python(
                     "result": message.get("result"),
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
+                    "hypotheses": list(message.get("hypotheses") or []),
                 }
 
             _wait_for_process_exit(process)
@@ -605,3 +872,46 @@ def run_sandboxed_python(
                 "stdout": "",
                 "action_results": list(host_action_results),
             }
+
+
+def run_sandboxed_check(
+    *,
+    check_code: str,
+    transitions: list[dict[str, Any]],
+    timeout_seconds: int,
+    alt_actions: list[str] | None = None,
+    perturb: bool = True,
+) -> dict[str, Any]:
+    """Run hypothesis check code against recorded transitions in the same
+    restricted sandbox (import allowlist, builtins, rlimits, timeout).
+
+    ``transitions`` items are compact dicts: ``action``, ``before``/``after``
+    (lists of row strings in ARC color chars), ``before_step``, ``before_level``,
+    ``step``, ``level`` and ``result``. Returns the sandbox's check report with
+    ``status`` pass/fail/not_applicable/error/timeout.
+    """
+
+    def _no_actions(_actions: list[dict[str, Any]], **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("action() is not available while checking a hypothesis.")
+
+    outcome = run_sandboxed_python(
+        code="",
+        timeout_seconds=timeout_seconds,
+        initial_state={},
+        action_handler=_no_actions,
+        extra_payload={
+            "mode": "check",
+            "check_code": str(check_code or ""),
+            "transitions": transitions,
+            "alt_actions": list(alt_actions or []),
+            "perturb": bool(perturb),
+        },
+    )
+    error = str(outcome.get("error", "") or "")
+    if error:
+        status = "timeout" if "timed out" in error else "error"
+        return {"status": status, "error": error}
+    report = outcome.get("result")
+    if not isinstance(report, dict):
+        return {"status": "error", "error": "check returned no report"}
+    return report
