@@ -243,6 +243,35 @@ def test_vacuous_check_is_unfalsifiable():
     assert report["falsifiable"] is False
 
 
+def test_crash_on_perturbed_transition_is_inconclusive():
+    # Passes on real moves, raises IndexError on the frozen variant (no changed cells),
+    # and returns True on the swapped/flipped variants: never a clean False.
+    transitions = [_transition("RIGHT", BEFORE, AFTER_RIGHT, 1), _transition("RIGHT", BEFORE, AFTER_RIGHT, 2)]
+    report = run_sandboxed_check(
+        check_code="def check_transition(t):\n    return changed_cells(t.before_frame, t.after_frame)[0] is not None\n",
+        transitions=transitions,
+        timeout_seconds=10,
+    )
+    assert report["status"] == "pass"
+    assert report["falsifiable"] is False
+
+
+def test_crash_on_one_variant_does_not_hide_clean_false_on_another():
+    # Frozen variant of the first transition crashes; frozen variant of the second
+    # returns a clean False. (Keyed on before_frame.step, which perturbation keeps.)
+    check = (
+        "def check_transition(t):\n"
+        "    changes = changed_cells(t.before_frame, t.after_frame)\n"
+        "    if t.before_frame.step == 0:\n"
+        "        return changes[0] is not None\n"
+        "    return len(changes) > 0\n"
+    )
+    transitions = [_transition("RIGHT", BEFORE, AFTER_RIGHT, 1), _transition("RIGHT", BEFORE, AFTER_RIGHT, 2)]
+    report = run_sandboxed_check(check_code=check, transitions=transitions, timeout_seconds=10)
+    assert report["status"] == "pass"
+    assert report["falsifiable"] is True
+
+
 def test_whole_list_check_counts_one_support():
     transitions = [_transition("RIGHT", BEFORE, AFTER_RIGHT, 1), _transition("RIGHT", BEFORE, AFTER_RIGHT, 2)]
     report = run_sandboxed_check(

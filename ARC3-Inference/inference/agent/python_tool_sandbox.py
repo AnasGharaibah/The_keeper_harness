@@ -461,15 +461,22 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             applied = [t for t, item in zip(transitions, outcomes) if item is True][:_PERTURB_LIMIT]
         else:
             applied = list(transitions)
+        # Falsifiable only on a clean False. A crash on a perturbed transition is
+        # inconclusive: skip it. "each" checks run per variant so one crash can't
+        # hide a clean False on another variant.
         falsifiable = False
         for kind in ("frozen", "swapped", "flipped"):
             variants = [_perturbed(t, kind, alt_actions) for t in applied]
-            try:
-                rejected = False in _outcomes(form, fn, variants)
-            except Exception:
-                rejected = True  # crashing on a perturbed transition also discriminates
-            if rejected:
-                falsifiable = True
+            groups = [[variant] for variant in variants] if form == "each" else [variants]
+            for group in groups:
+                try:
+                    perturbed_outcomes = _outcomes(form, fn, group)
+                except Exception:
+                    continue
+                if False in perturbed_outcomes:
+                    falsifiable = True
+                    break
+            if falsifiable:
                 break
         report["falsifiable"] = falsifiable
         return report
