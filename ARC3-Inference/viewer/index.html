@@ -1113,6 +1113,9 @@
       if (step.actionDisplay) {
         metaBits.push(step.actionDisplay);
       }
+      if (step.predictionLabel) {
+        metaBits.push(step.predictionLabel);
+      }
       const meta = metaBits.length
         ? `<div class="event-meta">${escapeHtml(metaBits.join(" · "))}</div>`
         : "";
@@ -1611,6 +1614,7 @@
         </div>
         <div class="summary-grid">
           ${renderSummaryItem(actionLabelText, actionValue)}
+          ${step.predictionLabel ? renderSummaryItem("Prediction", step.predictionDiff ? `${step.predictionLabel} — ${step.predictionDiff}` : step.predictionLabel) : ""}
           ${renderSummaryItem("Reward", rewardValue != null ? formatSigned(rewardValue) : "—")}
           ${renderSummaryItem("Score", step.score != null ? formatNumber(step.score) : (event.score != null ? formatNumber(event.score) : "—"))}
           ${renderSummaryItem("State", stateValue)}

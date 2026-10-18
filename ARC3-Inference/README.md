@@ -128,6 +128,40 @@ two B200 GPUs and starts one local vLLM server per GPU. In that mode
 `concurrent_jobs` is interpreted per GPU/server, so the effective concurrency is
 32.
 
+## Optional Layers
+
+Two harness layers are switchable from `analyzer.*` and default to off, so
+`configs/inference.json` behaves exactly as before:
+
+- `analyzer.prediction_check`: the duck may call
+  `action(..., expect={...})` (keys `board_changed`, `level_completed`,
+  `game_over`, `moves`, `appears`, `disappears`, `cells`, `note`). The harness
+  compares the expectation with the real before/after boards and adds a
+  `prediction_check` block (`confirmed` / `WRONG` + diff) to the tool result,
+  exposes `last_prediction` / `prediction_log`, and marks wrong moves in the
+  viewer.
+- `analyzer.level_review`: the duck records claims with
+  `hypothesis(text, kind="rule"|"goal", check_code=None)`. After each level,
+  game over, and at run end, the harness runs every check in the restricted
+  sandbox against the level's transitions. A claim becomes a fact only if it
+  passes, applies to at least `min_support` transitions, and rejects at least
+  one harness-perturbed transition. One optional LLM call per level may write
+  missing check code (which is then executed) or flag contradictions; it never
+  promotes a fact. Facts are re-checked on later levels, pinned in the system
+  message (never evicted), and saved to `artifacts/<game>_p<N>_facts.json`.
+
+A/B configs: `configs/inference.json` (baseline),
+`configs/inference.layer1.json` (prediction check only), and
+`configs/inference.layers.json` (both layers). The layers are not wired into
+the Kaggle notebook template yet, so they are off on Kaggle.
+
+To use a vLLM server on another machine, override the base URL:
+
+```bash
+LOCAL_ANALYZER_BASE_URL=http://<VLLM_HOST>:<PORT>/v1 \
+  CONFIG_PATH=configs/inference.layers.json make interactive GAME=<game>
+```
+
 ## Running Games
 
 Run inline in the current process:
