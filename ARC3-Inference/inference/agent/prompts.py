@@ -100,6 +100,13 @@ PYTHON_ADDENDUM = (
     "- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.\n"
 )
 
+PREDICTION_CHECK_ADDENDUM = (
+    "\n\nPrediction checks:\n"
+    "- When an action tests a hypothesis, state what you expect: `action(['RIGHT'], expect={'moves': {obj_id_or_hash: [0, 1]}, 'board_changed': True})` or `action('MOUSE', row=r, col=c, expect={...})`.\n"
+    "- `expect` keys (all optional): `board_changed`, `level_completed`, `game_over` (bools); `moves` {id_or_hash: [d_row, d_col]} (ids from the board before the action); `appears` [color char or hash]; `disappears` [id_or_hash]; `cells` {(row, col): color char}; `note` (free text).\n"
+    "- The harness checks it against the real result and reports `confirmed` or `WRONG` with the exact diff in the tool result's `prediction_check`, in `last_prediction`, and in `prediction_log`. WRONG means your model of that action is wrong: revise it before relying on it.\n"
+)
+
 COMPACT_TOOL_SESSION_ADDENDUM = (
     "\n\nTool session rules:\n"
     "- You have exactly one tool: `python`.\n"

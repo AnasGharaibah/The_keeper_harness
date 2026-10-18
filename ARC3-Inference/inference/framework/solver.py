@@ -34,6 +34,7 @@ from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
     write_runtime_state,
 )
+from inference.agent.prediction import compare_expectation, unchecked_prediction
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
@@ -306,6 +307,10 @@ class _HarnessGameSession:
                         self._append_analysis_viewer_event(
                             analysis_step, transcript_delta
                         )
+                    layer_events_added = self._append_layer_viewer_events(
+                        analysis_step
+                    )
+                    if transcript_delta.strip() or layer_events_added:
                         self.write_viewer_payload()
                 if result is None:
                     raise RuntimeError("Analyzer did not return a result.")
@@ -415,6 +420,32 @@ class _HarnessGameSession:
                 "transcript": transcript,
             }
         )
+
+    def _append_layer_viewer_events(self, analysis_step: int | None) -> bool:
+        """Append board-less events (prediction stats, level reviews) that the
+        analyzer buffered; the viewer's step builder ignores unknown types."""
+        drain = getattr(self.analyzer, "drain_layer_events", None)
+        if not callable(drain):
+            return False
+        try:
+            events = list(drain() or [])
+        except Exception:
+            return False
+        added = False
+        for event in events:
+            if not isinstance(event, dict) or not event.get("type"):
+                continue
+            self.viewer_events.append(
+                {
+                    "title": str(event.get("type")).replace("_", " ").title(),
+                    "action_num": self.action_count,
+                    "analysis_step": analysis_step,
+                    "level": _level_number(self.game),
+                    **event,
+                }
+            )
+            added = True
+        return added
 
     def _append_action_viewer_event(
         self, payload: dict[str, Any], frame: Frame
@@ -592,6 +623,10 @@ class _HarnessGameSession:
         if self.should_stop() or _is_engine_game_over(self.game):
             return self._terminal_payload(requested_actions)
 
+        expect = arguments.get("expect")
+        before_grid = (
+            _grid_from_state(self.game.current_state) if expect is not None else None
+        )
         executed_payloads: list[dict[str, Any]] = []
         total_reward = 0.0
         stop_reason: str | None = None
@@ -657,8 +692,38 @@ class _HarnessGameSession:
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
+        if expect is not None:
+            final_payload["prediction"] = self._check_expectation(
+                expect, before_grid, final_payload
+            )
         self.write_viewer_payload()
         return final_payload
+
+    def _check_expectation(
+        self,
+        expect: Any,
+        before_grid: tuple[tuple[int, ...], ...] | None,
+        final_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            prediction = compare_expectation(
+                expect,
+                before_grid=before_grid,
+                after_grid=_grid_from_state(self.game.current_state),
+                result=final_payload,
+            )
+        except Exception as exc:
+            prediction = unchecked_prediction(f"check error: {type(exc).__name__}")
+        # Annotate the batch's last action event before it is flushed to the
+        # append-only events sidecar, so the viewer can show the verdict.
+        for event in reversed(self.viewer_events):
+            if event.get("type") == "action":
+                event["prediction_verdict"] = prediction.get("verdict")
+                failures = prediction.get("failures") or []
+                if failures:
+                    event["prediction_diff"] = "; ".join(failures)[:400]
+                break
+        return prediction
 
     def _execute_auto_reset(self) -> None:
         action = arcengine.ActionInput(id=arcengine.GameAction.RESET, data={})

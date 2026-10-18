@@ -307,6 +307,22 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return normalized
 
 
+    def _normalize_expect(expect):
+        if not isinstance(expect, dict):
+            raise TypeError("action(..., expect=...) expects a dict, e.g. {'board_changed': True}.")
+        normalized = dict(expect)
+        cells = normalized.get("cells")
+        if isinstance(cells, dict):
+            items = []
+            for key, color in cells.items():
+                if isinstance(key, (tuple, list)) and len(key) == 2:
+                    items.append([key[0], key[1], color])
+                else:
+                    items.append([str(key), color])
+            normalized["cells"] = items
+        return _json_safe(normalized)
+
+
     def main():
         initial = _recv()
         global COLOR_CHARS
@@ -352,10 +368,19 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["last_action"] = last_transition.action if last_transition is not None else None
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["last_action_result"] = action_result
+            runtime_globals["last_prediction"] = state_payload.get("last_prediction")
+            runtime_globals["prediction_log"] = list(state_payload.get("prediction_log") or [])
 
-        def action(actions):
+        def action(actions, row=None, col=None, expect=None):
+            if row is not None or col is not None:
+                if not isinstance(actions, str):
+                    raise TypeError("row/col keywords need one action name, e.g. action('MOUSE', row=4, col=7).")
+                actions = {"action": actions, "row": row, "col": col}
             normalized_actions = _normalize_actions(actions)
-            _send({"type": "action", "actions": normalized_actions})
+            message = {"type": "action", "actions": normalized_actions}
+            if expect is not None:
+                message["expect"] = _normalize_expect(expect)
+            _send(message)
             reply = _recv()
             if reply.get("type") == "action_error":
                 raise RuntimeError(str(reply.get("error", "action failed")))
@@ -536,7 +561,13 @@ def run_sandboxed_python(
             msg_type = str(message.get("type", "")).strip()
             if msg_type == "action":
                 try:
-                    action_result_payload = action_handler(list(message.get("actions") or []))
+                    if message.get("expect") is None:
+                        action_result_payload = action_handler(list(message.get("actions") or []))
+                    else:
+                        action_result_payload = action_handler(
+                            list(message.get("actions") or []),
+                            expect=message.get("expect"),
+                        )
                 except Exception:  # noqa: BLE001
                     _send_json_line(
                         process.stdin,

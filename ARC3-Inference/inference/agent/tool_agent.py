@@ -14,9 +14,17 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
+from inference.agent.layer_config import PredictionCheckConfig
+from inference.agent.prediction import (
+    VERDICT_WRONG,
+    prediction_counts,
+    summarize_predictions,
+    unchecked_prediction,
+)
 from inference.agent.prompts import (
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
+    PREDICTION_CHECK_ADDENDUM,
     PYTHON_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
@@ -162,6 +170,10 @@ _PYTHON_TOOL_DESCRIPTION = (
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
     "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
     "Use `print(...)` for compact output or assign final data to `result`."
+)
+_PYTHON_TOOL_PREDICTION_DESCRIPTION = (
+    " Pass `expect={...}` to `action(...)` to have the harness check your predicted effect "
+    "(`last_prediction`, `prediction_log`)."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -347,7 +359,7 @@ def _format_model_response_meta(
     return "\n".join(lines)
 
 
-def _build_system_prompt(*, tool_output_tokens: int) -> str:
+def _build_system_prompt(*, tool_output_tokens: int, prediction_check: bool = False) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
@@ -355,6 +367,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += MULTIMODAL_CONTEXT_ADDENDUM
     prompt += VISUAL_GAME_ADDENDUM
     prompt += PYTHON_ADDENDUM
+    if prediction_check:
+        prompt += PREDICTION_CHECK_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
     return prompt
 
@@ -913,6 +927,7 @@ class ToolAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         provider: str | None = None,
+        prediction_check: PredictionCheckConfig | None = None,
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
@@ -938,9 +953,18 @@ class ToolAgent:
         self._tool_output_tokens = max(64, _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS)
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
+        self._prediction_config = prediction_check or PredictionCheckConfig.from_env()
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
+            prediction_check=self._prediction_config.enabled,
         )
+        self._tool_description = _PYTHON_TOOL_DESCRIPTION + (
+            _PYTHON_TOOL_PREDICTION_DESCRIPTION if self._prediction_config.enabled else ""
+        )
+        # One entry per executed action(...) call (all levels), plus viewer events
+        # buffered for the solver to drain after each turn.
+        self._prediction_entries: list[dict[str, Any]] = []
+        self._layer_events: list[dict[str, Any]] = []
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -982,6 +1006,23 @@ class ToolAgent:
             self._last_step_summary = None
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
+            self._prediction_entries = []
+            self._layer_events = []
+
+    def drain_layer_events(self) -> list[dict[str, Any]]:
+        """Return and clear viewer events buffered by the optional layers."""
+        events, self._layer_events = self._layer_events, []
+        return events
+
+    def _sandbox_prediction_state(self, level: int | None) -> dict[str, Any]:
+        if not self._prediction_config.enabled:
+            return {}
+        entries = [entry for entry in self._prediction_entries if level is None or entry.get("level") == level]
+        size = self._prediction_config.sandbox_log_size
+        return {
+            "last_prediction": self._prediction_entries[-1] if self._prediction_entries else None,
+            "prediction_log": entries[-size:] if size > 0 else [],
+        }
 
     @property
     def total_tokens(self) -> int:
@@ -1262,7 +1303,7 @@ class ToolAgent:
                 "type": "function",
                 "function": {
                     "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION,
+                    "description": self._tool_description,
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1488,11 +1529,45 @@ class ToolAgent:
                     if isinstance(persisted_action_result, dict)
                     else {}
                 ),
+                **self._sandbox_prediction_state(
+                    refreshed_frame.level if refreshed_frame is not None else None
+                ),
             }
 
         terminal_action_result: dict[str, Any] | None = None
+        call_predictions: list[dict[str, Any]] = []
+        current_level = current_frame.level if current_frame is not None else None
 
-        def _handle_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
+        def _record_prediction(
+            compact_payload: dict[str, Any],
+            raw_payload: dict[str, Any],
+            expect: Any,
+        ) -> None:
+            nonlocal current_level
+            prediction = raw_payload.get("prediction")
+            if not isinstance(prediction, dict):
+                prediction = unchecked_prediction()
+            entry: dict[str, Any] = {
+                "action_num": compact_payload.get("action_num"),
+                "actions": list(compact_payload.get("executed_actions") or []),
+                "level": current_level,
+                **prediction,
+            }
+            if expect is not None:
+                entry["expect"] = expect
+            self._prediction_entries.append(entry)
+            call_predictions.append(entry)
+            compact_payload["prediction"] = {
+                key: prediction.get(key)
+                for key in ("verdict", "failures", "skipped", "note")
+                if prediction.get(key)
+            }
+            try:
+                current_level = int(compact_payload.get("level"))
+            except (TypeError, ValueError):
+                pass
+
+        def _handle_action(actions: list[dict[str, Any]], expect: Any = None) -> dict[str, Any]:
             nonlocal terminal_action_result
             if self._step_env_callback is None:
                 raise RuntimeError("action(actions) is not available in this session.")
@@ -1526,10 +1601,19 @@ class ToolAgent:
                         last_action_result=compact_payload,
                     ),
                 }
-            raw_payload = self._step_env_callback({"actions": normalized_actions})
+            step_arguments: dict[str, Any] = {"actions": normalized_actions}
+            if self._prediction_config.enabled and expect is not None:
+                step_arguments["expect"] = expect
+            raw_payload = self._step_env_callback(step_arguments)
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             compact_payload = self._compact_action_result(raw_payload)
+            if self._prediction_config.enabled and compact_payload.get("executed"):
+                _record_prediction(
+                    compact_payload,
+                    raw_payload,
+                    step_arguments.get("expect"),
+                )
             next_valid_actions = raw_payload.get("valid_actions")
             if isinstance(next_valid_actions, list):
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
@@ -1577,6 +1661,23 @@ class ToolAgent:
                         "action_calls": len(action_results),
                         "last_action_result": action_results[-1],
                     }
+        if call_predictions:
+            payload["prediction_check"] = summarize_predictions(
+                call_predictions,
+                max_wrong_diffs_shown=self._prediction_config.max_wrong_diffs_shown,
+            )
+            counts = prediction_counts(call_predictions)
+            self._layer_events.append(
+                {
+                    "type": "prediction_check",
+                    "counts": counts,
+                    "wrong_diffs": [
+                        "; ".join(entry.get("failures") or [])
+                        for entry in call_predictions
+                        if entry.get("verdict") == VERDICT_WRONG
+                    ][: self._prediction_config.max_wrong_diffs_shown],
+                }
+            )
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
         if step_executed:

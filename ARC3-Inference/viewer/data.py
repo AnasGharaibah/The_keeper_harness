@@ -963,6 +963,9 @@ def _compact_viewer_step(step: dict[str, Any]) -> dict[str, Any]:
         compact["stepRangeLabel"] = step.get("stepRangeLabel")
     if step.get("stateTransition"):
         compact["stateTransition"] = step.get("stateTransition")
+    for key in ("predictionLabel", "predictionDiff"):
+        if step.get(key):
+            compact[key] = step.get(key)
     for key in ("reward", "score", "state", "level"):
         if step.get(key) is not None:
             compact[key] = step.get(key)
@@ -1438,7 +1441,7 @@ def _build_action_summary(actions: list[dict[str, Any]]) -> dict[str, Any] | Non
     first_action_num = _normalize_step_number(actions[0].get("action_num"))
     last_action_num = _normalize_step_number(actions[-1].get("action_num"))
     prior_event = actions[0].get("_viewer_pre_board_event")
-    return {
+    summary = {
         "actionDisplay": " -> ".join(
             _action_display_with_prior_state(action, prior_event if index == 0 else None)
             for index, action in enumerate(actions)
@@ -1448,6 +1451,28 @@ def _build_action_summary(actions: list[dict[str, Any]]) -> dict[str, Any] | Non
         "reward": sum(_normalized_number(action.get("reward")) for action in actions),
         "stateTransition": _state_transition(prior_event, actions[-1]),
     }
+    summary.update(_prediction_summary(actions))
+    return summary
+
+
+def _prediction_summary(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    verdicts = [str(action.get("prediction_verdict")) for action in actions if action.get("prediction_verdict")]
+    if not verdicts:
+        return {}
+    wrong = verdicts.count("wrong")
+    confirmed = verdicts.count("confirmed")
+    parts = []
+    if wrong:
+        parts.append(f"✗ {wrong} wrong")
+    if confirmed:
+        parts.append(f"✓ {confirmed} confirmed")
+    if not parts:
+        parts.append(f"{len(verdicts)} unchecked")
+    summary: dict[str, Any] = {"predictionLabel": " · ".join(parts)}
+    first_diff = next((str(action.get("prediction_diff")) for action in actions if action.get("prediction_diff")), "")
+    if first_diff:
+        summary["predictionDiff"] = first_diff
+    return summary
 
 
 def _apply_action_summary(step: dict[str, Any], action_summary: dict[str, Any] | None) -> dict[str, Any]:
@@ -1457,6 +1482,9 @@ def _apply_action_summary(step: dict[str, Any], action_summary: dict[str, Any] |
     payload["batchSize"] = int(action_summary.get("batchSize", 0)) if action_summary else 0
     payload["reward"] = action_summary.get("reward") if action_summary else None
     payload["stateTransition"] = action_summary.get("stateTransition") if action_summary else None
+    for key in ("predictionLabel", "predictionDiff"):
+        if action_summary and action_summary.get(key):
+            payload[key] = action_summary.get(key)
     return payload
 
 
