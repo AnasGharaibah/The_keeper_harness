@@ -118,6 +118,14 @@ class LevelReviewConfig:
     # "LEARNED LAST LEVEL" block: review cause sentence plus untested ideas.
     learned_block: bool = True
     max_untested_shown: int = 3
+    # One LLM call after every level end, even with no agent hypotheses: states the
+    # likely cause of the win/death and proposes hypotheses (source="reviewer").
+    post_level_review: bool = True
+    max_reviewer_hypotheses: int = 5
+    # Per-move summaries in the review prompt (consecutive identical effects merged).
+    max_review_moves: int = 60
+    # Open hypotheses with check code carried across levels (0 = no cap).
+    max_carried_unverified: int = 10
 
     @classmethod
     def from_env(cls) -> "LevelReviewConfig":
@@ -158,5 +166,13 @@ class LevelReviewConfig:
             learned_block=_env_bool(f"{_REVIEW_PREFIX}LEARNED_BLOCK", defaults.learned_block),
             max_untested_shown=max(
                 0, _env_int(f"{_REVIEW_PREFIX}MAX_UNTESTED_SHOWN", defaults.max_untested_shown)
+            ),
+            post_level_review=_env_bool(f"{_REVIEW_PREFIX}POST_LEVEL_REVIEW", defaults.post_level_review),
+            max_reviewer_hypotheses=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEWER_HYPOTHESES", defaults.max_reviewer_hypotheses)
+            ),
+            max_review_moves=max(1, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEW_MOVES", defaults.max_review_moves)),
+            max_carried_unverified=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_CARRIED_UNVERIFIED", defaults.max_carried_unverified)
             ),
         )

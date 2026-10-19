@@ -11,11 +11,20 @@ demoted when they fail. The LLM never promotes anything by opinion.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from inference.agent.auto_prediction import (
+    VERDICT_SURPRISE,
+    describe_effect,
+    effect,
+    effect_signature,
+    grid_transitions_for_level,
+    hud_mask,
+)
 from inference.agent.layer_config import LevelReviewConfig
 from inference.agent.prediction import VERDICT_WRONG, format_prediction_line, prediction_counts
 from inference.agent.runtime_state import HistoryEntry
@@ -24,6 +33,7 @@ STATUS_PENDING = "pending"
 STATUS_FACT = "fact"
 STATUS_REFUTED = "refuted"
 STATUS_UNVERIFIED = "unverified"
+STATUS_DROPPED = "dropped"
 
 # (check_code, transitions, alt_actions, perturb) -> sandbox check report
 CheckRunner = Callable[[str, list[dict[str, Any]], list[str], bool], dict[str, Any]]
@@ -32,6 +42,13 @@ LlmCall = Callable[[list[dict[str, Any]], float], str]
 
 _MIN_LLM_SECONDS = 5.0
 _STANDARD_ACTIONS = ["UP", "DOWN", "LEFT", "RIGHT", "SPACE"]
+
+POST_LEVEL_SYSTEM_PROMPT = (
+    "You analyse one finished level of a grid puzzle game played by an agent. From the recorded moves you "
+    "state the most likely cause of how the level ended and propose testable rules, each with Python check "
+    "code. A harness runs the code on the recorded transitions and alone decides what is true. "
+    "Reply with one JSON object and nothing else."
+)
 
 REVIEW_SYSTEM_PROMPT = (
     "You review claims made by an agent playing a grid puzzle game. "
@@ -68,6 +85,8 @@ class Hypothesis:
     falsifiable_seen: bool = False
     checked_through_step: int = 0
     quick_check: dict[str, Any] | None = None
+    # "agent" (hypothesis() in the sandbox) or "reviewer" (proposed by the post-level review).
+    source: str = "agent"
 
     def tag(self) -> str:
         return f"{self.id} [{self.kind}]"
@@ -132,6 +151,128 @@ def parse_review_response(text: str) -> tuple[list[tuple[str, str]], list[tuple[
         elif isinstance(item, str) and item.strip():
             contradicted.append((item.strip(), ""))
     return checks, contradicted
+
+
+_CAUSE_RE = re.compile(r'"cause"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _salvage_objects(raw: str) -> list[dict[str, Any]]:
+    """Complete JSON objects inside a reply whose outer object is cut off (the
+    model hit max_tokens): scan each ``{`` and keep what decodes."""
+    decoder = json.JSONDecoder()
+    found: list[dict[str, Any]] = []
+    index = raw.find("{", 1)
+    while index >= 0:
+        try:
+            value, end = decoder.raw_decode(raw, index)
+        except ValueError:
+            index = raw.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        index = raw.find("{", end)
+    return found
+
+
+def parse_post_level_response(text: str) -> dict[str, Any]:
+    """Parse ``{"cause", "hypotheses": [{text, kind, check_code}], "checks", "contradicted"}`` leniently,
+    salvaging the cause and every complete item from a truncated reply."""
+    checks, contradicted = parse_review_response(text)
+    raw = str(text or "")
+    start, end = raw.find("{"), raw.rfind("}")
+    data: Any = {}
+    if 0 <= start < end:
+        try:
+            data = json.loads(raw[start : end + 1])
+        except (TypeError, ValueError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    truncated = not data and start >= 0
+    if truncated:
+        objects = _salvage_objects(raw[start:])
+        match = _CAUSE_RE.search(raw)
+        cause_text = ""
+        if match:
+            try:
+                cause_text = json.loads(f'"{match.group(1)}"')
+            except ValueError:
+                cause_text = match.group(1)
+        data = {
+            "cause": cause_text,
+            "hypotheses": [item for item in objects if "text" in item],
+        }
+        checks = [
+            (str(item["id"]).strip(), str(item["check_code"]))
+            for item in objects
+            if "id" in item and str(item.get("check_code") or "").strip()
+        ]
+        contradicted = [
+            (str(item["id"]).strip(), " ".join(str(item.get("why", "")).split())[:200])
+            for item in objects
+            if "id" in item and "why" in item
+        ]
+    cause = " ".join(str(data.get("cause") or "").split())[:300]
+    hypotheses: list[dict[str, str]] = []
+    for item in data.get("hypotheses") or []:
+        if not isinstance(item, dict):
+            continue
+        claim = " ".join(str(item.get("text") or "").split())
+        if not claim:
+            continue
+        kind = str(item.get("kind") or "rule").strip().lower()
+        hypotheses.append(
+            {
+                "text": claim[:400],
+                "kind": kind if kind in ("rule", "goal") else "rule",
+                "check_code": str(item.get("check_code") or "").strip(),
+            }
+        )
+    return {
+        "cause": cause,
+        "hypotheses": hypotheses,
+        "checks": checks,
+        "contradicted": contradicted,
+        "truncated": truncated,
+    }
+
+
+def merged_move_lines(
+    history: list[HistoryEntry],
+    level: int,
+    results_by_step: dict[int, dict[str, Any]],
+    *,
+    hud_change_fraction: float,
+    max_lines: int,
+) -> list[str]:
+    """Per-move effect summaries for one level: consecutive identical effects of the
+    same action are merged (``RIGHT x7: ... each``); keeps the last ``max_lines``
+    lines and always the final move."""
+    transitions = grid_transitions_for_level(history, level)
+    for item in transitions:
+        item["result"] = dict(results_by_step.get(int(item["step"])) or {})
+    if not transitions:
+        return []
+    mask = hud_mask(transitions, change_fraction=hud_change_fraction)
+    groups: list[list[Any]] = []  # [action, signature, description, count, first_step, last_step]
+    for item in transitions:
+        item_effect = effect(item, mask)
+        signature = (str(item["action"]), effect_signature(item_effect))
+        if groups and groups[-1][1] == signature:
+            groups[-1][3] += 1
+            groups[-1][5] = item["step"]
+            continue
+        groups.append([str(item["action"]), signature, describe_effect(item_effect), 1, item["step"], item["step"]])
+    lines = []
+    for action, _signature, description, count, first, last in groups:
+        if count == 1:
+            lines.append(f"step {first} {action}: {description}")
+        else:
+            lines.append(f"steps {first}-{last} {action} x{count}: {description} each")
+    if len(lines) > max_lines:
+        omitted = len(lines) - max_lines
+        lines = [f"... {omitted} earlier move groups omitted", *lines[-max_lines:]]
+    return lines
 
 
 class LevelMemory:
@@ -256,6 +397,8 @@ class LevelMemory:
         check_runner: CheckRunner,
         llm_call: LlmCall | None,
         time_budget_seconds: float,
+        auto_entries: list[dict[str, Any]] | None = None,
+        hud_change_fraction: float = 0.8,
     ) -> list[dict[str, Any]]:
         deadline = time.monotonic() + max(0.0, float(time_budget_seconds))
         summaries: list[dict[str, Any]] = []
@@ -270,6 +413,8 @@ class LevelMemory:
                     check_runner=check_runner,
                     llm_call=llm_call,
                     deadline=deadline,
+                    auto_entries=auto_entries or [],
+                    hud_change_fraction=hud_change_fraction,
                 )
             )
         self.save()
@@ -285,6 +430,8 @@ class LevelMemory:
         check_runner: CheckRunner,
         llm_call: LlmCall | None,
         deadline: float,
+        auto_entries: list[dict[str, Any]] | None = None,
+        hud_change_fraction: float = 0.8,
     ) -> dict[str, Any]:
         started = time.monotonic()
         transitions = level_transitions(
@@ -317,7 +464,30 @@ class LevelMemory:
         ]
         needs_code = [h for h in candidates if not h.check_code]
         remaining = deadline - time.monotonic()
-        if llm_call is not None and candidates:
+        if llm_call is not None and self.config.post_level_review:
+            self._post_level_llm(
+                level,
+                reason,
+                history=history,
+                transitions=transitions,
+                max_step=max_step,
+                alt_actions=alt_actions,
+                level_predictions=level_predictions,
+                candidates=candidates,
+                needs_code=needs_code,
+                check_runner=check_runner,
+                llm_call=llm_call,
+                deadline=deadline,
+                summary=summary,
+                surprises=[
+                    line
+                    for entry in auto_entries or []
+                    if entry.get("level") == level and entry.get("verdict") == VERDICT_SURPRISE
+                    for line in entry.get("lines") or []
+                ],
+                hud_change_fraction=hud_change_fraction,
+            )
+        elif llm_call is not None and candidates:
             used = self._llm_calls_by_level.get(level, 0)
             if used >= self.config.max_llm_calls_per_level:
                 summary["llm"] = "skipped: per-level call limit"
@@ -362,12 +532,131 @@ class LevelMemory:
                             continue
                         self._refute(hypothesis, level, f"review: contradicted by the evidence. {why}".strip(), summary)
 
+        self._enforce_carry_cap(summary)
         summary["facts"] = sum(1 for h in self.hypotheses if h.status == STATUS_FACT)
         summary["seconds"] = round(time.monotonic() - started, 2)
         self.level_stats.append(summary)
         self.last_review = summary
         self._notices.append(self._summary_notice(summary))
         return summary
+
+    def _post_level_llm(
+        self,
+        level: int,
+        reason: str,
+        *,
+        history: list[HistoryEntry],
+        transitions: list[dict[str, Any]],
+        max_step: int,
+        alt_actions: list[str],
+        level_predictions: list[dict[str, Any]],
+        candidates: list[Hypothesis],
+        needs_code: list[Hypothesis],
+        check_runner: CheckRunner,
+        llm_call: LlmCall,
+        deadline: float,
+        summary: dict[str, Any],
+        surprises: list[str],
+        hud_change_fraction: float,
+    ) -> None:
+        """The single post-level call: cause of the win/death plus up to N reviewer
+        hypotheses with check code, all verified by the same mechanical path."""
+        summary["reviewer_hypotheses"] = []
+        used = self._llm_calls_by_level.get(level, 0)
+        remaining = deadline - time.monotonic()
+        if used >= self.config.max_llm_calls_per_level:
+            summary["llm"] = "skipped: per-level call limit"
+            return
+        if remaining < _MIN_LLM_SECONDS:
+            summary["llm"] = "skipped: no time left"
+            return
+        self._llm_calls_by_level[level] = used + 1
+        moves = merged_move_lines(
+            history,
+            level,
+            self._results_by_step,
+            hud_change_fraction=hud_change_fraction,
+            max_lines=self.config.max_review_moves,
+        )
+        messages = self.build_post_level_messages(level, reason, transitions, moves, surprises, level_predictions, candidates)
+        try:
+            reply = llm_call(messages, min(self.config.llm_timeout_seconds, remaining - 1.0))
+        except Exception as exc:  # noqa: BLE001 - any failure just skips the LLM step
+            summary["llm"] = f"failed: {type(exc).__name__}"
+            return
+        summary["llm"] = "ran"
+        parsed = parse_post_level_response(reply)
+        if parsed["truncated"]:
+            summary["llm"] = "ran (reply truncated, complete items kept)"
+        if parsed["cause"]:
+            self.level_causes[level] = parsed["cause"]
+            summary["cause"] = parsed["cause"]
+
+        candidate_ids = {h.id for h in needs_code}
+        for hypothesis_id, check_code in parsed["checks"]:
+            hypothesis = self.get(hypothesis_id)
+            if hypothesis is None or hypothesis.id not in candidate_ids:
+                continue
+            hypothesis.check_code = check_code
+            hypothesis.check_origin = "review"
+            hypothesis.checked_through_step = 0
+            if time.monotonic() >= deadline:
+                summary["budget_exhausted"] = True
+                continue
+            self._check_and_decide(hypothesis, level, transitions, max_step, alt_actions, check_runner, summary)
+
+        known = {(h.text.lower(), h.kind) for h in self.hypotheses}
+        for item in parsed["hypotheses"][: self.config.max_reviewer_hypotheses]:
+            if (item["text"].lower(), item["kind"]) in known or not item["check_code"]:
+                continue
+            if len(self.hypotheses) >= self.config.max_hypotheses:
+                summary["reviewer_limit"] = True
+                break
+            hypothesis = Hypothesis(
+                id=f"H{self.next_index}",
+                text=item["text"],
+                kind=item["kind"],
+                level=level,
+                check_code=item["check_code"],
+                check_origin="review",
+                source="reviewer",
+            )
+            self.next_index += 1
+            self.hypotheses.append(hypothesis)
+            known.add((hypothesis.text.lower(), hypothesis.kind))
+            summary["reviewer_hypotheses"].append(hypothesis.id)
+            if time.monotonic() >= deadline:
+                summary["budget_exhausted"] = True
+                continue
+            self._check_and_decide(hypothesis, level, transitions, max_step, alt_actions, check_runner, summary)
+
+        shown_ids = {h.id for h in candidates}
+        for hypothesis_id, why in parsed["contradicted"]:
+            hypothesis = self.get(hypothesis_id)
+            if (
+                hypothesis is None
+                or hypothesis.id not in shown_ids
+                or hypothesis.status in (STATUS_FACT, STATUS_REFUTED)
+                or hypothesis.checked_through_step > 0
+            ):
+                continue
+            self._refute(hypothesis, level, f"review: contradicted by the evidence. {why}".strip(), summary)
+
+    def _enforce_carry_cap(self, summary: dict[str, Any]) -> None:
+        """Keep at most ``max_carried_unverified`` open hypotheses with check code
+        (highest support, then most recent); the rest are dropped from re-checking."""
+        cap = self.config.max_carried_unverified
+        if cap <= 0:
+            return
+        order = {h.id: index for index, h in enumerate(self.hypotheses)}
+        carried = sorted(
+            (h for h in self.hypotheses if h.status in (STATUS_PENDING, STATUS_UNVERIFIED) and h.check_code),
+            key=lambda h: (-h.support, -order[h.id]),
+        )
+        for hypothesis in carried[cap:]:
+            hypothesis.status = STATUS_DROPPED
+            hypothesis.reason = f"dropped: more than {cap} open hypotheses carried"
+            summary.setdefault("dropped", []).append(hypothesis.id)
 
     def _checkable(self, level: int) -> list[Hypothesis]:
         facts = [h for h in self.hypotheses if h.status == STATUS_FACT and h.check_code]
@@ -467,8 +756,12 @@ class LevelMemory:
                     else:
                         details.append(f"{hypothesis_id} ({hypothesis.reason[:120]})")
                 parts.append(f"{label}: {', '.join(details)};")
+        if summary.get("reviewer_hypotheses"):
+            parts.append(f"reviewer proposed: {', '.join(summary['reviewer_hypotheses'])};")
         if len(parts) == 1 or (len(parts) == 2 and any(counts.values())):
             parts.append("no hypothesis changed status;")
+        if summary.get("cause"):
+            parts.append(f"likely cause (not verified): {summary['cause']};")
         return " ".join(parts).rstrip(";") + "."
 
     def build_review_messages(
@@ -522,6 +815,66 @@ class LevelMemory:
         )
         return [
             {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n".join(lines)},
+        ]
+
+    def build_post_level_messages(
+        self,
+        level: int,
+        reason: str,
+        transitions: list[dict[str, Any]],
+        moves: list[str],
+        surprises: list[str],
+        level_predictions: list[dict[str, Any]],
+        candidates: list[Hypothesis],
+    ) -> list[dict[str, Any]]:
+        ending = {
+            "level_completed": "the agent WON this level",
+            "game_over": "the agent DIED (game over) on this level",
+            "run_complete": "the agent finished the whole game",
+        }.get(reason, "the run stopped while this level was in progress (no win or death)")
+        wrong = [format_prediction_line(entry) for entry in level_predictions if entry.get("verdict") == VERDICT_WRONG]
+        facts = [h for h in self.hypotheses if h.status == STATUS_FACT]
+        lines = [
+            f"Level {level}: {len(transitions)} recorded moves; how it ended: {ending}.",
+            "Per-move effects (object hashes as in segmentation; timer/HUD cells ignored; the last line is the final move):",
+            *(f"- {line}" for line in moves),
+        ]
+        if surprises:
+            lines.append("SURPRISES (an action did something different from the last time it was used):")
+            lines.extend(f"- {line}" for line in surprises[-10:])
+        if wrong:
+            lines.append("Agent predictions the harness found WRONG:")
+            lines.extend(f"- {line}" for line in wrong[:10])
+        if facts:
+            lines.append("Already verified facts (context only):")
+            lines.extend(f"- {h.tag()} {h.text}" for h in facts[:10])
+        if candidates:
+            lines.append("Agent's open hypotheses:")
+            for hypothesis in candidates:
+                state = "no check_code" if not hypothesis.check_code else f"{hypothesis.status}: {hypothesis.reason or 'awaiting evidence'}"
+                lines.append(f"- {hypothesis.tag()} {hypothesis.text} ({state})")
+        lines.extend(
+            [
+                "",
+                CHECK_API_TEXT,
+                "Tasks:",
+                "(a) In one sentence, state the most likely cause of how the level ended (what the final move did "
+                "and which earlier events were needed for it).",
+                f"(b) Propose up to {self.config.max_reviewer_hypotheses} hypotheses about the game's rules or goal "
+                "that explain the moves above, especially ones that connect events (e.g. 'touching X changes Y', "
+                "'the level ends when A matches B'). Each needs check code that returns False on a transition "
+                "that violates it and None when it does not apply.",
+                "(c) For each agent hypothesis marked 'no check_code', write check code; (d) list agent hypotheses "
+                "the evidence contradicts.",
+                "Be brief: the cause first, at most 12 lines of check code per hypothesis, no comments in code.",
+                'Reply JSON: {"cause": "one sentence", "hypotheses": [{"text": "...", "kind": "rule"|"goal", '
+                '"check_code": "def check_transition(t):\\n    ..."}], "checks": [{"id": "H1", "check_code": "..."}], '
+                '"contradicted": [{"id": "H2", "why": "short reason"}]}',
+            ]
+        )
+        return [
+            {"role": "system", "content": POST_LEVEL_SYSTEM_PROMPT},
             {"role": "user", "content": "\n".join(lines)},
         ]
 

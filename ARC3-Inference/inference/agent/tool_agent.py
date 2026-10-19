@@ -1189,6 +1189,8 @@ class ToolAgent:
                 check_runner=self._run_review_check,
                 llm_call=llm_call,
                 time_budget_seconds=budget,
+                auto_entries=self._auto_entries,
+                hud_change_fraction=self._prediction_config.hud_change_fraction,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must never stop play
             log.warning("level review failed: %s", exc)

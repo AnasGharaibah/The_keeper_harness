@@ -91,7 +91,11 @@
       "max_review_transitions": 300,
       "max_hypotheses": 60,
       "learned_block": true,
-      "max_untested_shown": 3
+      "max_untested_shown": 3,
+      "post_level_review": true,
+      "max_reviewer_hypotheses": 5,
+      "max_review_moves": 60,
+      "max_carried_unverified": 10
     },
     "world_model": {
       "enabled": true,
