@@ -71,7 +71,10 @@
       "nudge_after_actions": 5,
       "auto_predict": true,
       "hud_change_fraction": 0.8,
-      "max_surprises_shown": 3
+      "max_surprises_shown": 3,
+      "perception": true,
+      "perception_min_size": 3,
+      "perception_max_lines": 3
     },
     "level_review": {
       "enabled": true,

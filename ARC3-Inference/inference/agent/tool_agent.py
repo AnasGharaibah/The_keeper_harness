@@ -18,8 +18,10 @@ from inference.agent.auto_prediction import (
     VERDICT_SURPRISE,
     auto_predict,
     grid_transitions_for_level,
+    hud_mask,
     summarize_auto,
 )
+from inference.agent.perception import PerceptionTracker
 from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig, WorldModelConfig
 from inference.agent.level_memory import LevelMemory
 from inference.agent.prediction import (
@@ -30,6 +32,7 @@ from inference.agent.prediction import (
 )
 from inference.agent.prompts import (
     AUTO_PREDICTION_ADDENDUM,
+    PERCEPTION_ADDENDUM,
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
     LEVEL_REVIEW_ADDENDUM,
@@ -427,6 +430,7 @@ def _build_system_prompt(
     level_review: bool = False,
     auto_predict: bool = False,
     world_model: bool = False,
+    perception: bool = False,
 ) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -439,6 +443,8 @@ def _build_system_prompt(
         prompt += PREDICTION_CHECK_ADDENDUM
         if auto_predict:
             prompt += AUTO_PREDICTION_ADDENDUM
+            if perception:
+                prompt += PERCEPTION_ADDENDUM
     if level_review:
         prompt += LEVEL_REVIEW_ADDENDUM
     if world_model:
@@ -1046,6 +1052,7 @@ class ToolAgent:
             level_review=self._review_config.enabled,
             auto_predict=self._prediction_config.auto_predict,
             world_model=self._world_model_config.enabled,
+            perception=self._prediction_config.perception,
         )
         self._tool_description = (
             _PYTHON_TOOL_DESCRIPTION
@@ -1064,6 +1071,7 @@ class ToolAgent:
         self._moves_without_expect = 0
         self._world_model_called_this_turn = False
         self._turns_without_world_model = 0
+        self._perception = self._new_perception_tracker()
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -1112,11 +1120,18 @@ class ToolAgent:
             self._moves_without_expect = 0
             self._world_model_called_this_turn = False
             self._turns_without_world_model = 0
+            self._perception = self._new_perception_tracker()
             self._level_memory = (
                 LevelMemory(self._review_config, facts_path=_facts_path(state_path))
                 if self._review_config.enabled
                 else None
             )
+
+    def _new_perception_tracker(self) -> PerceptionTracker | None:
+        config = self._prediction_config
+        if not (config.enabled and config.auto_predict and config.perception):
+            return None
+        return PerceptionTracker(min_size=config.perception_min_size, max_lines=config.perception_max_lines)
 
     def drain_layer_events(self) -> list[dict[str, Any]]:
         """Return and clear viewer events buffered by the optional layers."""
@@ -1191,6 +1206,10 @@ class ToolAgent:
                 time_budget_seconds=budget,
                 auto_entries=self._auto_entries,
                 hud_change_fraction=self._prediction_config.hud_change_fraction,
+                perception_max_lines=(
+                    self._prediction_config.perception_max_lines if self._perception is not None else 0
+                ),
+                perception_min_size=self._prediction_config.perception_min_size,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must never stop play
             log.warning("level review failed: %s", exc)
@@ -1844,6 +1863,10 @@ class ToolAgent:
                     verdicts = auto_predict(
                         transitions, change_fraction=config.hud_change_fraction, new_count=new_count
                     )
+                    if self._perception is not None and verdicts:
+                        mask = hud_mask(transitions, change_fraction=config.hud_change_fraction)
+                        for verdict, transition in zip(verdicts, transitions[len(transitions) - len(verdicts) :]):
+                            verdict["perception"] = self._perception.observe(transition, mask, level=level)
                 except Exception as exc:  # noqa: BLE001 - auto-prediction must never break an action
                     log.warning("auto prediction failed: %s", exc)
                     verdicts = []
@@ -1853,7 +1876,9 @@ class ToolAgent:
                 call_auto.extend(verdicts)
                 if verdicts:
                     compact_payload["auto_prediction"] = summarize_auto(
-                        verdicts, max_surprises_shown=config.max_surprises_shown
+                        verdicts,
+                        max_surprises_shown=config.max_surprises_shown,
+                        max_perception_shown=2 * config.perception_max_lines,
                     )
             if config.nudge_after_actions > 0:
                 if expect is not None:
@@ -2008,7 +2033,9 @@ class ToolAgent:
                 self._layer_events.append({"type": "world_model", "stored": stored})
         if call_auto:
             payload["auto_prediction"] = summarize_auto(
-                call_auto, max_surprises_shown=self._prediction_config.max_surprises_shown
+                call_auto,
+                max_surprises_shown=self._prediction_config.max_surprises_shown,
+                max_perception_shown=2 * self._prediction_config.perception_max_lines,
             )
             self._layer_events.append(
                 {
@@ -2023,6 +2050,9 @@ class ToolAgent:
                         if entry["verdict"] == VERDICT_SURPRISE
                         for line in entry["lines"]
                     ][: self._prediction_config.max_surprises_shown],
+                    "perception": [line for entry in call_auto for line in entry.get("perception") or []][
+                        : 2 * self._prediction_config.perception_max_lines
+                    ],
                 }
             )
         if call_warnings:

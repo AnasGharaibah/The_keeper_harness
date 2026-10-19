@@ -26,6 +26,7 @@ from inference.agent.auto_prediction import (
     hud_mask,
 )
 from inference.agent.layer_config import LevelReviewConfig
+from inference.agent.perception import replay_level
 from inference.agent.prediction import VERDICT_WRONG, format_prediction_line, prediction_counts
 from inference.agent.runtime_state import HistoryEntry
 
@@ -244,25 +245,36 @@ def merged_move_lines(
     *,
     hud_change_fraction: float,
     max_lines: int,
+    perception_max_lines: int = 0,
+    perception_min_size: int = 3,
 ) -> list[str]:
     """Per-move effect summaries for one level: consecutive identical effects of the
     same action are merged (``RIGHT x7: ... each``); keeps the last ``max_lines``
-    lines and always the final move."""
+    lines and always the final move. With ``perception_max_lines`` > 0 the
+    perception lines of each move are appended (and such moves are never merged)."""
     transitions = grid_transitions_for_level(history, level)
     for item in transitions:
         item["result"] = dict(results_by_step.get(int(item["step"])) or {})
     if not transitions:
         return []
     mask = hud_mask(transitions, change_fraction=hud_change_fraction)
+    perceived: list[list[str]] = [[] for _ in transitions]
+    if perception_max_lines > 0:
+        perceived = replay_level(
+            transitions, mask, level=level, min_size=perception_min_size, max_lines=perception_max_lines
+        )
     groups: list[list[Any]] = []  # [action, signature, description, count, first_step, last_step]
-    for item in transitions:
+    for item, lines in zip(transitions, perceived):
         item_effect = effect(item, mask)
-        signature = (str(item["action"]), effect_signature(item_effect))
+        signature = (str(item["action"]), effect_signature(item_effect), tuple(lines))
         if groups and groups[-1][1] == signature:
             groups[-1][3] += 1
             groups[-1][5] = item["step"]
             continue
-        groups.append([str(item["action"]), signature, describe_effect(item_effect), 1, item["step"], item["step"]])
+        description = describe_effect(item_effect)
+        if lines:
+            description += " | PERCEIVED: " + " / ".join(lines)
+        groups.append([str(item["action"]), signature, description, 1, item["step"], item["step"]])
     lines = []
     for action, _signature, description, count, first, last in groups:
         if count == 1:
@@ -291,6 +303,8 @@ class LevelMemory:
         # Reviewer's one-sentence cause per reviewed level, and the latest review.
         self.level_causes: dict[int, str] = {}
         self.last_review: dict[str, Any] | None = None
+        # (perception_max_lines, perception_min_size) for the review's move summaries; 0 lines = off.
+        self._perception: tuple[int, int] = (0, 3)
 
     # ----- recording ---------------------------------------------------
 
@@ -399,8 +413,11 @@ class LevelMemory:
         time_budget_seconds: float,
         auto_entries: list[dict[str, Any]] | None = None,
         hud_change_fraction: float = 0.8,
+        perception_max_lines: int = 0,
+        perception_min_size: int = 3,
     ) -> list[dict[str, Any]]:
         deadline = time.monotonic() + max(0.0, float(time_budget_seconds))
+        self._perception = (perception_max_lines, perception_min_size)
         summaries: list[dict[str, Any]] = []
         pending, self._pending = self._pending, []
         for level, reason in pending:
@@ -571,12 +588,15 @@ class LevelMemory:
             summary["llm"] = "skipped: no time left"
             return
         self._llm_calls_by_level[level] = used + 1
+        perception_max_lines, perception_min_size = self._perception
         moves = merged_move_lines(
             history,
             level,
             self._results_by_step,
             hud_change_fraction=hud_change_fraction,
             max_lines=self.config.max_review_moves,
+            perception_max_lines=perception_max_lines,
+            perception_min_size=perception_min_size,
         )
         messages = self.build_post_level_messages(level, reason, transitions, moves, surprises, level_predictions, candidates)
         try:

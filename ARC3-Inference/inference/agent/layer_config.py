@@ -48,6 +48,10 @@ class PredictionCheckConfig:
     # Cells changing in at least this fraction of a level's transitions are HUD and ignored.
     hud_change_fraction: float = 0.8
     max_surprises_shown: int = 3
+    # Perception lines (transformations, shape matches, roles) in auto_prediction.
+    perception: bool = True
+    perception_min_size: int = 3
+    perception_max_lines: int = 3
 
     @classmethod
     def from_env(cls) -> "PredictionCheckConfig":
@@ -66,6 +70,13 @@ class PredictionCheckConfig:
             ),
             max_surprises_shown=max(
                 0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_MAX_SURPRISES_SHOWN", defaults.max_surprises_shown)
+            ),
+            perception=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION", defaults.perception),
+            perception_min_size=max(
+                1, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION_MIN_SIZE", defaults.perception_min_size)
+            ),
+            perception_max_lines=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION_MAX_LINES", defaults.perception_max_lines)
             ),
         )
 

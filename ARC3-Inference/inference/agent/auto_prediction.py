@@ -246,8 +246,14 @@ def auto_predict(
     return verdicts
 
 
-def summarize_auto(verdicts: list[dict[str, Any]], *, max_surprises_shown: int) -> list[str]:
-    """Tool-result lines: a count line, then SURPRISE lines, then first-time effects."""
+def summarize_auto(
+    verdicts: list[dict[str, Any]],
+    *,
+    max_surprises_shown: int,
+    max_perception_shown: int = 0,
+) -> list[str]:
+    """Tool-result lines: a count line, then perception lines, then SURPRISE lines,
+    then first-time effects."""
     if not verdicts:
         return []
     counts = {VERDICT_AS_BEFORE: 0, VERDICT_SURPRISE: 0, VERDICT_FIRST_TIME: 0}
@@ -257,6 +263,16 @@ def summarize_auto(verdicts: list[dict[str, Any]], *, max_surprises_shown: int) 
         f"auto: {counts[VERDICT_AS_BEFORE]} as before / {counts[VERDICT_SURPRISE]} surprise / "
         f"{counts[VERDICT_FIRST_TIME]} first time (vs the last same action on this level; HUD ignored)"
     ]
+    perceived = [
+        f"PERCEIVED after {entry['action']} (step {entry.get('step')}): {line}"
+        for entry in verdicts
+        for line in entry.get("perception") or []
+    ]
+    shown_perception = max(0, int(max_perception_shown))
+    if shown_perception:
+        lines.extend(perceived[:shown_perception])
+        if len(perceived) > shown_perception:
+            lines.append(f"... {len(perceived) - shown_perception} more perception lines")
     surprises = [line for entry in verdicts if entry["verdict"] == VERDICT_SURPRISE for line in entry["lines"]]
     shown = surprises[: max(0, int(max_surprises_shown))]
     lines.extend(shown)
