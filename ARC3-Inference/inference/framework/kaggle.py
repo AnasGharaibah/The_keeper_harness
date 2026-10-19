@@ -304,7 +304,7 @@ def tail_server_log(lines: int = 80) -> str:
     return '\n'.join(VLLM_SERVER_LOG.read_text(encoding='utf-8', errors='replace').splitlines()[-lines:])
 
 
-def wait_for_vllm_server(timeout_seconds: int = 900) -> None:
+def wait_for_vllm_server(timeout_seconds: int = 2700) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f'{VLLM_BASE_URL}/models'
     while time.monotonic() < deadline:
@@ -322,8 +322,46 @@ def wait_for_vllm_server(timeout_seconds: int = 900) -> None:
     raise TimeoutError(f'Timed out waiting for vLLM server at {url}.\nLast server log lines:\n{tail_server_log()}')
 
 
+def log_memory() -> None:
+    try:
+        info = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines() if ':' in line)
+        total = int(info['MemTotal'].split()[0]) / 1024 / 1024
+        available = int(info['MemAvailable'].split()[0]) / 1024 / 1024
+        print(f'Host RAM: {total:.1f} GiB total, {available:.1f} GiB available', flush=True)
+    except (OSError, KeyError, ValueError) as exc:
+        print(f'Host RAM: unknown ({exc!r})', flush=True)
+
+
+def prefetch_model_weights(chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    # Read the weight files once, sequentially, so vLLM's memory-mapped load hits
+    # the page cache instead of random reads on the network-backed dataset mount
+    # (the page cache is evictable, so this cannot exhaust host RAM).
+    files = sorted(MODEL_PATH.glob('*.safetensors'))
+    total = sum(path.stat().st_size for path in files)
+    print(f'Prefetching {len(files)} weight file(s), {total / 1e9:.1f} GB', flush=True)
+    started = time.monotonic()
+    done = 0
+    next_report = started + 60
+    for path in files:
+        with path.open('rb', buffering=0) as handle:
+            while True:
+                block = handle.read(chunk_bytes)
+                if not block:
+                    break
+                done += len(block)
+                if time.monotonic() >= next_report:
+                    rate = done / max(1e-6, time.monotonic() - started) / 1e6
+                    print(f'  prefetched {done / 1e9:.1f}/{total / 1e9:.1f} GB ({rate:.0f} MB/s)', flush=True)
+                    next_report += 60
+    elapsed = time.monotonic() - started
+    print(f'Prefetch done in {elapsed:.0f}s ({done / max(1e-6, elapsed) / 1e6:.0f} MB/s)', flush=True)
+
+
 def start_vllm_server() -> None:
     install_vllm_wheelhouse()
+    log_memory()
+    prefetch_model_weights()
+    log_memory()
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_PID.unlink(missing_ok=True)
     log_handle = VLLM_SERVER_LOG.open('w', encoding='utf-8')
