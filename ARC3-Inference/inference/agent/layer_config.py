@@ -70,6 +70,30 @@ class PredictionCheckConfig:
         )
 
 
+_WORLD_MODEL_PREFIX = "LOCAL_ANALYZER_WORLD_MODEL_"
+
+
+@dataclass(frozen=True)
+class WorldModelConfig:
+    """``world_model(text)`` / ``plan(text)`` in the sandbox, stored by the harness
+    and re-injected every turn."""
+
+    enabled: bool = False
+    # Reminder in the user prompt after this many turns without world_model() (0 = off).
+    nudge_after_turns: int = 3
+    # Without a world_model() call, take the last "World model:" / "Plan:" lines from the reasoning.
+    reasoning_fallback: bool = True
+
+    @classmethod
+    def from_env(cls) -> "WorldModelConfig":
+        defaults = cls()
+        return cls(
+            enabled=_env_bool(f"{_WORLD_MODEL_PREFIX}ENABLED", defaults.enabled),
+            nudge_after_turns=max(0, _env_int(f"{_WORLD_MODEL_PREFIX}NUDGE_AFTER_TURNS", defaults.nudge_after_turns)),
+            reasoning_fallback=_env_bool(f"{_WORLD_MODEL_PREFIX}REASONING_FALLBACK", defaults.reasoning_fallback),
+        )
+
+
 _REVIEW_PREFIX = "LOCAL_ANALYZER_LEVEL_REVIEW_"
 
 
@@ -91,6 +115,9 @@ class LevelReviewConfig:
     quick_check_seconds: float = 3.0
     max_review_transitions: int = 300
     max_hypotheses: int = 60
+    # "LEARNED LAST LEVEL" block: review cause sentence plus untested ideas.
+    learned_block: bool = True
+    max_untested_shown: int = 3
 
     @classmethod
     def from_env(cls) -> "LevelReviewConfig":
@@ -128,4 +155,8 @@ class LevelReviewConfig:
                 1, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEW_TRANSITIONS", defaults.max_review_transitions)
             ),
             max_hypotheses=max(1, _env_int(f"{_REVIEW_PREFIX}MAX_HYPOTHESES", defaults.max_hypotheses)),
+            learned_block=_env_bool(f"{_REVIEW_PREFIX}LEARNED_BLOCK", defaults.learned_block),
+            max_untested_shown=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_UNTESTED_SHOWN", defaults.max_untested_shown)
+            ),
         )

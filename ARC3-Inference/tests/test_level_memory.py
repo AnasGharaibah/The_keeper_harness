@@ -355,3 +355,40 @@ def test_end_to_end_with_real_sandbox_checks():
     assert memory.get(real).support == 3
     assert memory.get(vacuous).status == "unverified"
     assert memory.get(wrong).status == "refuted"
+
+
+# ----- LEARNED LAST LEVEL block -------------------------------------------------
+
+
+def test_learned_block_shows_cause_and_untested_ideas_only():
+    memory = LevelMemory(LevelReviewConfig(enabled=True, max_untested_shown=2))
+    assert memory.render_learned_block() == ""
+    memory.add_hypotheses(
+        [
+            {"id": "H1", "text": "entering the top box wins", "kind": "goal", "level": 1},
+            {"id": "H2", "text": "UP moves the player", "kind": "rule", "level": 1},
+            {"id": "H3", "text": "something always true", "kind": "rule", "level": 1},
+            {"id": "H4", "text": "verified thing", "kind": "rule", "level": 1},
+        ],
+        default_level=1,
+    )
+    h1, h2, h3, h4 = (memory.get(f"H{i}") for i in range(1, 5))
+    h1.status, h1.support = "unverified", 1
+    h2.status, h2.support = "unverified", 0
+    h3.status, h3.support, h3.reason = "unverified", 9, "unfalsifiable: also passed on harness-perturbed transitions"
+    h4.status = "fact"
+    memory.last_review = {"level": 1, "reason": "level_completed"}
+    memory.level_causes[1] = "The player entered the top box after the indicator matched."
+    block = memory.render_learned_block()
+    assert block.startswith("LEARNED LAST LEVEL (L1, level_completed):")
+    assert "Likely cause (reviewer's reading, not verified): The player entered the top box" in block
+    assert "UNTESTED IDEAS (test these with expect=):" in block
+    assert "- H1 entering the top box wins [unverified, support 1]" in block
+    assert "H2 UP moves the player" in block
+    assert "H3" not in block and "H4" not in block
+
+
+def test_learned_block_switch_off():
+    memory = LevelMemory(LevelReviewConfig(enabled=True, learned_block=False))
+    memory.last_review = {"level": 1, "reason": "level_completed"}
+    assert memory.render_learned_block() == ""

@@ -20,7 +20,7 @@ from inference.agent.auto_prediction import (
     grid_transitions_for_level,
     summarize_auto,
 )
-from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig
+from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig, WorldModelConfig
 from inference.agent.level_memory import LevelMemory
 from inference.agent.prediction import (
     VERDICT_WRONG,
@@ -35,6 +35,7 @@ from inference.agent.prompts import (
     LEVEL_REVIEW_ADDENDUM,
     PREDICTION_CHECK_ADDENDUM,
     PYTHON_ADDENDUM,
+    WORLD_MODEL_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
@@ -184,6 +185,10 @@ _PYTHON_TOOL_PREDICTION_DESCRIPTION = (
     " Pass `expect={...}` to `action(...)` to have the harness check your predicted effect "
     "(`last_prediction`, `prediction_log`)."
 )
+_PYTHON_TOOL_WORLD_MODEL_DESCRIPTION = (
+    " Call `world_model(text)` / `plan(text)` to store your current understanding and plan; "
+    "the harness shows them back to you every turn."
+)
 _PYTHON_TOOL_REVIEW_DESCRIPTION = (
     " Call `hypothesis(text, kind='rule'|'goal', check_code=None)` to record a claim the harness "
     "verifies after the level."
@@ -321,6 +326,49 @@ def _extract_scientist_note(content: str) -> dict[str, str]:
     return result
 
 
+_REASONING_NOTE_LABELS = {
+    "world model": "world_model",
+    "goal model": "goal_model",
+    "action model": "action_model",
+    "open questions": "open_questions",
+    "plan": "current_plan",
+}
+_REASONING_NOTE_MAX_CHARS = 600
+
+
+def _extract_last_notes_from_reasoning(reasoning: str) -> dict[str, str]:
+    """Last ``World model:`` / ``Goal model:`` / ``Action model:`` / ``Open questions:``
+    / ``Plan:`` block in free reasoning text. A block runs from its label to the next
+    blank line or label, capped, so a label early in a long monologue does not
+    swallow everything after it."""
+    found: dict[str, str] = {}
+    lines = str(reasoning or "").splitlines()
+    index = 0
+    while index < len(lines):
+        candidate = lines[index].strip().lstrip("-*").strip().lstrip("#").strip().replace("**", "")
+        lowered = candidate.lower()
+        key = next(
+            (key for label, key in _REASONING_NOTE_LABELS.items() if lowered.startswith(f"{label}:")),
+            None,
+        )
+        if key is None:
+            index += 1
+            continue
+        parts = [candidate.split(":", 1)[1].strip()]
+        index += 1
+        while index < len(lines):
+            follow = lines[index].strip()
+            follow_label = follow.lstrip("-*").strip().lstrip("#").strip().replace("**", "").lower()
+            if not follow or any(follow_label.startswith(f"{label}:") for label in _REASONING_NOTE_LABELS):
+                break
+            parts.append(follow)
+            index += 1
+        text = " ".join(part for part in parts if part).strip()
+        if text:
+            found[key] = text[:_REASONING_NOTE_MAX_CHARS]
+    return found
+
+
 def _empty_world_model() -> dict[str, str]:
     return {
         "world_model": "",
@@ -378,6 +426,7 @@ def _build_system_prompt(
     prediction_check: bool = False,
     level_review: bool = False,
     auto_predict: bool = False,
+    world_model: bool = False,
 ) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -392,6 +441,8 @@ def _build_system_prompt(
             prompt += AUTO_PREDICTION_ADDENDUM
     if level_review:
         prompt += LEVEL_REVIEW_ADDENDUM
+    if world_model:
+        prompt += WORLD_MODEL_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
     return prompt
 
@@ -960,6 +1011,7 @@ class ToolAgent:
         provider: str | None = None,
         prediction_check: PredictionCheckConfig | None = None,
         level_review: LevelReviewConfig | None = None,
+        world_model: WorldModelConfig | None = None,
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
@@ -987,16 +1039,19 @@ class ToolAgent:
         self._save_request_logs = bool(save_request_logs)
         self._prediction_config = prediction_check or PredictionCheckConfig.from_env()
         self._review_config = level_review or LevelReviewConfig.from_env()
+        self._world_model_config = world_model or WorldModelConfig.from_env()
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
             prediction_check=self._prediction_config.enabled,
             level_review=self._review_config.enabled,
             auto_predict=self._prediction_config.auto_predict,
+            world_model=self._world_model_config.enabled,
         )
         self._tool_description = (
             _PYTHON_TOOL_DESCRIPTION
             + (_PYTHON_TOOL_PREDICTION_DESCRIPTION if self._prediction_config.enabled else "")
             + (_PYTHON_TOOL_REVIEW_DESCRIPTION if self._review_config.enabled else "")
+            + (_PYTHON_TOOL_WORLD_MODEL_DESCRIPTION if self._world_model_config.enabled else "")
         )
         self._level_memory: LevelMemory | None = None
         # One entry per executed action(...) call (all levels), plus viewer events
@@ -1007,6 +1062,8 @@ class ToolAgent:
         self._auto_entries: list[dict[str, Any]] = []
         self._step_flags: dict[int, dict[str, Any]] = {}
         self._moves_without_expect = 0
+        self._world_model_called_this_turn = False
+        self._turns_without_world_model = 0
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -1053,6 +1110,8 @@ class ToolAgent:
             self._auto_entries = []
             self._step_flags = {}
             self._moves_without_expect = 0
+            self._world_model_called_this_turn = False
+            self._turns_without_world_model = 0
             self._level_memory = (
                 LevelMemory(self._review_config, facts_path=_facts_path(state_path))
                 if self._review_config.enabled
@@ -1069,8 +1128,9 @@ class ToolAgent:
         ``messages[0]``, which context trimming never evicts, so the block is pinned."""
         if self._level_memory is None:
             return self._system_prompt
-        block = self._level_memory.render_pinned_block()
-        return f"{self._system_prompt}\n\n{block}" if block else self._system_prompt
+        blocks = [self._level_memory.render_pinned_block(), self._level_memory.render_learned_block()]
+        blocks = [block for block in blocks if block]
+        return "\n\n".join([self._system_prompt, *blocks])
 
     def _initial_messages(self, user_message: dict[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -1171,6 +1231,8 @@ class ToolAgent:
             state["next_hypothesis_index"] = self._level_memory.next_index
             state["quick_check_seconds"] = self._review_config.quick_check_seconds
             state["transition_results"] = self._level_memory.transition_results_payload()
+        if self._world_model_config.enabled:
+            state["world_model_enabled"] = True
         return state
 
     @property
@@ -1299,6 +1361,41 @@ class ToolAgent:
         for key, value in note.items():
             if value:
                 self._summarized_knowledge[key] = value
+
+    def _world_model_from_reasoning(self, reasoning: str) -> None:
+        """Fallback when the model reasons about its world model but never calls
+        world_model(): keep the last labelled block from the reasoning."""
+        config = self._world_model_config
+        if not config.enabled or not config.reasoning_fallback or self._world_model_called_this_turn:
+            return
+        notes = _extract_last_notes_from_reasoning(reasoning)
+        for key, value in notes.items():
+            self._summarized_knowledge[key] = value
+        if notes:
+            self._layer_events.append({"type": "world_model", "stored": sorted(notes), "source": "reasoning"})
+
+    def _begin_world_model_turn(self) -> str:
+        """Close the bookkeeping for the previous turn and return a nudge line when
+        world_model() has not been called for ``nudge_after_turns`` turns."""
+        config = self._world_model_config
+        if not config.enabled:
+            return ""
+        if self._last_step_summary is None and not self._history_messages:
+            return ""
+        if self._world_model_called_this_turn:
+            self._turns_without_world_model = 0
+        else:
+            self._turns_without_world_model += 1
+        self._world_model_called_this_turn = False
+        if config.nudge_after_turns <= 0 or self._turns_without_world_model < config.nudge_after_turns:
+            return ""
+        turns = self._turns_without_world_model
+        self._turns_without_world_model = 0
+        self._layer_events.append({"type": "world_model_nudge", "turns": turns})
+        return (
+            f"WORLD MODEL NOT UPDATED FOR {turns} TURNS \u2014 call world_model(text) with what you now believe "
+            "(entities, what each action does, how things are connected, the goal, open questions)."
+        )
 
     def _update_summarized_knowledge_from_step_summary(self) -> None:
         summary = self._last_step_summary
@@ -1894,6 +1991,19 @@ class ToolAgent:
                     ][: self._prediction_config.max_wrong_diffs_shown],
                 }
             )
+        notes = sandbox_result.get("notes") or {}
+        if self._world_model_config.enabled and notes:
+            stored = []
+            if notes.get("world_model"):
+                self._summarized_knowledge["world_model"] = str(notes["world_model"])
+                stored.append("world_model")
+            if notes.get("plan"):
+                self._summarized_knowledge["current_plan"] = str(notes["plan"])
+                stored.append("plan")
+            if stored:
+                self._world_model_called_this_turn = True
+                payload["memory_stored"] = f"{' and '.join(stored)} stored; shown back to you every turn"
+                self._layer_events.append({"type": "world_model", "stored": stored})
         if call_auto:
             payload["auto_prediction"] = summarize_auto(
                 call_auto, max_surprises_shown=self._prediction_config.max_surprises_shown
@@ -2082,6 +2192,9 @@ class ToolAgent:
             history_entries=history_entries,
             previous_step_summary=self._last_step_summary,
         )
+        world_model_nudge = self._begin_world_model_turn()
+        if world_model_nudge:
+            user_prompt = "\n".join([world_model_nudge, "", user_prompt])
         if review_notices:
             user_prompt = "\n".join([*review_notices, "", user_prompt])
         display_action_num = _display_action_number(action_num)
@@ -2244,6 +2357,7 @@ class ToolAgent:
                 if reasoning:
                     captured_reasoning = reasoning
                     append_transcript("THINKING", reasoning)
+                    self._world_model_from_reasoning(reasoning)
                     assistant_message["reasoning"] = reasoning
 
                 if not tool_calls:

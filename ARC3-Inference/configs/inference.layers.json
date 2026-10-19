@@ -89,7 +89,14 @@
       "check_timeout_seconds": 10,
       "quick_check_seconds": 3,
       "max_review_transitions": 300,
-      "max_hypotheses": 60
+      "max_hypotheses": 60,
+      "learned_block": true,
+      "max_untested_shown": 3
+    },
+    "world_model": {
+      "enabled": true,
+      "nudge_after_turns": 3,
+      "reasoning_fallback": true
     }
   },
   "chat": {

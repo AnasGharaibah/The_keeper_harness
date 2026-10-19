@@ -7,10 +7,15 @@ from typing import Any
 
 import pytest
 
-from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig
+from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig, WorldModelConfig
 from inference.agent.prediction import compare_expectation
 from inference.agent.runtime_state import RUNTIME_STATE_FILENAME, Frame, HistoryEntry, write_runtime_state
-from inference.agent.tool_agent import ToolAgent, _build_system_prompt, _PYTHON_TOOL_DESCRIPTION
+from inference.agent.tool_agent import (
+    ToolAgent,
+    _build_system_prompt,
+    _extract_last_notes_from_reasoning,
+    _PYTHON_TOOL_DESCRIPTION,
+)
 
 OFF_PREDICTION = PredictionCheckConfig(enabled=False)
 OFF_REVIEW = LevelReviewConfig(enabled=False)
@@ -256,3 +261,60 @@ def test_nudge_after_consecutive_moves_without_expect(tmp_path):
     assert "prediction_warning" not in payload
     assert agent._moves_without_expect == 0
     assert any(event["type"] == "prediction_nudge" for event in agent.drain_layer_events())
+
+ON_WORLD_MODEL = WorldModelConfig(enabled=True, nudge_after_turns=2)
+
+
+def test_world_model_switch_off_keeps_prompt():
+    agent = ToolAgent(model="test-model", prediction_check=OFF_PREDICTION, level_review=OFF_REVIEW)
+    assert "world_model(" not in agent._system_prompt and "world_model(" not in agent._tool_description
+    assert agent._begin_world_model_turn() == ""
+
+
+def test_world_model_call_is_stored_and_shown_every_turn(tmp_path):
+    agent = ToolAgent(model="test-model", prediction_check=OFF_PREDICTION, level_review=OFF_REVIEW, world_model=ON_WORLD_MODEL)
+    assert "world_model(text)" in agent._system_prompt
+    state_path, _env = _setup(tmp_path, agent)
+    payload = _run(agent, state_path, "world_model('touching + rotates the bottom indicator')\nplan('match indicators, then enter box')")
+    assert payload["memory_stored"].startswith("world_model and plan stored")
+    lines = agent._summarized_knowledge_lines()
+    assert "- World model: touching + rotates the bottom indicator" in lines
+    assert "- Plan: match indicators, then enter box" in lines
+
+
+def test_world_model_nudge_after_turns_without_call(tmp_path):
+    agent = ToolAgent(model="test-model", prediction_check=OFF_PREDICTION, level_review=OFF_REVIEW, world_model=ON_WORLD_MODEL)
+    state_path, _env = _setup(tmp_path, agent)
+    assert agent._begin_world_model_turn() == ""  # first turn: nothing to judge yet
+    agent._history_messages = [{"role": "user", "content": "turn 1"}]
+    assert agent._begin_world_model_turn() == ""  # 1 turn without
+    nudge = agent._begin_world_model_turn()  # 2 turns without
+    assert nudge.startswith("WORLD MODEL NOT UPDATED FOR 2 TURNS")
+    _run(agent, state_path, "world_model('x')")
+    assert agent._begin_world_model_turn() == ""
+    assert agent._turns_without_world_model == 0
+
+
+def test_reasoning_fallback_takes_last_block_and_stops_at_blank_line(tmp_path):
+    reasoning = (
+        "Let me think.\n"
+        "World model: old idea\n\n"
+        "More thinking about the board, which goes on.\n"
+        "- **World model:** the + rotates the indicator\n"
+        "  each collection turns it 90 degrees\n"
+        "Plan: collect + until indicators match\n"
+        "\n"
+        "Unrelated text that must not be included."
+    )
+    notes = _extract_last_notes_from_reasoning(reasoning)
+    assert notes["world_model"] == "the + rotates the indicator each collection turns it 90 degrees"
+    assert notes["current_plan"] == "collect + until indicators match"
+
+    agent = ToolAgent(model="test-model", prediction_check=OFF_PREDICTION, level_review=OFF_REVIEW, world_model=ON_WORLD_MODEL)
+    _setup(tmp_path, agent)
+    agent._world_model_from_reasoning(reasoning)
+    assert agent._summarized_knowledge["world_model"].startswith("the + rotates")
+    # An explicit world_model() call this turn wins over the reasoning fallback.
+    agent._world_model_called_this_turn = True
+    agent._world_model_from_reasoning("World model: should be ignored")
+    assert agent._summarized_knowledge["world_model"].startswith("the + rotates")

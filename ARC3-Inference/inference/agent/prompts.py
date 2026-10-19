@@ -118,6 +118,12 @@ LEVEL_REVIEW_ADDENDUM = (
     "- After each level the harness runs every check on all of that level's transitions. A claim becomes a VERIFIED FACT only if its check passes, applies to enough transitions, and fails on harness-perturbed transitions. Facts stay pinned at the top of your context across levels; facts that later fail move to REFUTED.\n"
 )
 
+WORLD_MODEL_ADDENDUM = (
+    "\n\nWorking world model memory:\n"
+    "- Your private reasoning is NOT kept between turns. To remember, call `world_model(text)` from Python whenever your understanding changes: the entities and what they seem to be, what each action does, how things are connected (e.g. 'touching X changes Y'), the likely goal, and open questions. Call `plan(text)` for your next steps.\n"
+    "- The harness stores both and shows them back to you at the start of every turn. Rewrite the whole text each time (it replaces the old one).\n"
+)
+
 COMPACT_TOOL_SESSION_ADDENDUM = (
     "\n\nTool session rules:\n"
     "- You have exactly one tool: `python`.\n"

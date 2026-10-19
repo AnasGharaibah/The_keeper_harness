@@ -147,6 +147,9 @@ class LevelMemory:
         self._pending: list[tuple[int, str]] = []
         self._llm_calls_by_level: dict[int, int] = {}
         self._notices: list[str] = []
+        # Reviewer's one-sentence cause per reviewed level, and the latest review.
+        self.level_causes: dict[int, str] = {}
+        self.last_review: dict[str, Any] | None = None
 
     # ----- recording ---------------------------------------------------
 
@@ -362,6 +365,7 @@ class LevelMemory:
         summary["facts"] = sum(1 for h in self.hypotheses if h.status == STATUS_FACT)
         summary["seconds"] = round(time.monotonic() - started, 2)
         self.level_stats.append(summary)
+        self.last_review = summary
         self._notices.append(self._summary_notice(summary))
         return summary
 
@@ -553,12 +557,42 @@ class LevelMemory:
             block = block[: self.config.max_block_chars - 20].rstrip() + "\n- ... (truncated)"
         return block
 
+    def untested_ideas(self) -> list[Hypothesis]:
+        """Open claims worth testing: unverified or pending, not unfalsifiable, most
+        support first, then most recent."""
+        order = {h.id: index for index, h in enumerate(self.hypotheses)}
+        ideas = [
+            h for h in self.hypotheses
+            if h.status in (STATUS_UNVERIFIED, STATUS_PENDING) and not h.reason.startswith("unfalsifiable")
+        ]
+        return sorted(ideas, key=lambda h: (-h.support, -order[h.id]))
+
+    def render_learned_block(self) -> str:
+        """What the last reviewed level taught: the reviewer's cause sentence (not
+        verified) and a few untested ideas. Verified facts live in the pinned block."""
+        if not self.config.learned_block or self.last_review is None:
+            return ""
+        level = self.last_review.get("level")
+        lines = [f"LEARNED LAST LEVEL (L{level}, {self.last_review.get('reason')}):"]
+        cause = self.level_causes.get(int(level)) if level is not None else None
+        lines.append(f"- Likely cause (reviewer's reading, not verified): {cause}" if cause else "- Likely cause: not determined")
+        ideas = self.untested_ideas()[: self.config.max_untested_shown]
+        if ideas:
+            lines.append("UNTESTED IDEAS (test these with expect=):")
+            for h in ideas:
+                lines.append(f"- {h.id} {h.text} [{h.status}, support {h.support}]")
+        block = "\n".join(lines)
+        if len(block) > self.config.max_block_chars:
+            block = block[: self.config.max_block_chars - 20].rstrip() + "\n- ... (truncated)"
+        return block
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "config": asdict(self.config),
             "hypotheses": [asdict(h) for h in self.hypotheses],
             "level_stats": list(self.level_stats),
+            "level_causes": {str(level): cause for level, cause in self.level_causes.items()},
         }
 
     def save(self) -> None:
