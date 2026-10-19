@@ -107,6 +107,11 @@ PREDICTION_CHECK_ADDENDUM = (
     "- The harness checks it against the real result and reports `confirmed` or `WRONG` with the exact diff in the tool result's `prediction_check`, in `last_prediction`, and in `prediction_log`. WRONG means your model of that action is wrong: revise it before relying on it.\n"
 )
 
+AUTO_PREDICTION_ADDENDUM = (
+    "- An action without `expect=` is reported as `no_prediction`: it tests nothing.\n"
+    "- The harness also auto-predicts every action: it expects the same effect the same action had last time on this level (timer/HUD cells that change every step are ignored). Differences appear as `SURPRISE:` lines in the tool result's `auto_prediction`. A SURPRISE means your model of that action is incomplete: find out what was different before relying on it.\n"
+)
+
 LEVEL_REVIEW_ADDENDUM = (
     "\n\nRules and goals memory:\n"
     "- Record a claimed rule or goal from Python with `hypothesis(text, kind='rule' or 'goal', check_code=None)`. `check_code` is Python source defining `check_transition(t)` that returns True (claim held), False (violated) or None (does not apply) for one transition `t` (`t.action`, `t.before_frame`, `t.after_frame`, `t.result`). Helpers: `cell(frame, row, col)`, `changed_cells(a, b)` -> [(row, col, old, new)], `parse_action(t.action)` -> (name, row, col).\n"

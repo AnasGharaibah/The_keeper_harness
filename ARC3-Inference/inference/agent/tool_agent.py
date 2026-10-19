@@ -14,15 +14,22 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
+from inference.agent.auto_prediction import (
+    VERDICT_SURPRISE,
+    auto_predict,
+    grid_transitions_for_level,
+    summarize_auto,
+)
 from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig
 from inference.agent.level_memory import LevelMemory
 from inference.agent.prediction import (
     VERDICT_WRONG,
     prediction_counts,
     summarize_predictions,
-    unchecked_prediction,
+    no_prediction_result,
 )
 from inference.agent.prompts import (
+    AUTO_PREDICTION_ADDENDUM,
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
     LEVEL_REVIEW_ADDENDUM,
@@ -370,6 +377,7 @@ def _build_system_prompt(
     tool_output_tokens: int,
     prediction_check: bool = False,
     level_review: bool = False,
+    auto_predict: bool = False,
 ) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -380,6 +388,8 @@ def _build_system_prompt(
     prompt += PYTHON_ADDENDUM
     if prediction_check:
         prompt += PREDICTION_CHECK_ADDENDUM
+        if auto_predict:
+            prompt += AUTO_PREDICTION_ADDENDUM
     if level_review:
         prompt += LEVEL_REVIEW_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
@@ -981,6 +991,7 @@ class ToolAgent:
             tool_output_tokens=self._tool_output_tokens,
             prediction_check=self._prediction_config.enabled,
             level_review=self._review_config.enabled,
+            auto_predict=self._prediction_config.auto_predict,
         )
         self._tool_description = (
             _PYTHON_TOOL_DESCRIPTION
@@ -992,6 +1003,10 @@ class ToolAgent:
         # buffered for the solver to drain after each turn.
         self._prediction_entries: list[dict[str, Any]] = []
         self._layer_events: list[dict[str, Any]] = []
+        # Harness auto-predictions (source="auto"), kept apart from the model's expect= verdicts.
+        self._auto_entries: list[dict[str, Any]] = []
+        self._step_flags: dict[int, dict[str, Any]] = {}
+        self._moves_without_expect = 0
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -1035,6 +1050,9 @@ class ToolAgent:
             self._summarized_knowledge = _empty_world_model()
             self._prediction_entries = []
             self._layer_events = []
+            self._auto_entries = []
+            self._step_flags = {}
+            self._moves_without_expect = 0
             self._level_memory = (
                 LevelMemory(self._review_config, facts_path=_facts_path(state_path))
                 if self._review_config.enabled
@@ -1679,7 +1697,7 @@ class ToolAgent:
         ) -> None:
             prediction = raw_payload.get("prediction")
             if not isinstance(prediction, dict):
-                prediction = unchecked_prediction()
+                prediction = no_prediction_result()
             entry: dict[str, Any] = {
                 "action_num": compact_payload.get("action_num"),
                 "actions": list(compact_payload.get("executed_actions") or []),
@@ -1695,6 +1713,62 @@ class ToolAgent:
                 for key in ("verdict", "failures", "skipped", "note")
                 if prediction.get(key)
             }
+
+        call_auto: list[dict[str, Any]] = []
+        call_warnings: list[str] = []
+
+        def _record_auto_and_nudge(
+            compact_payload: dict[str, Any],
+            raw_payload: dict[str, Any],
+            expect: Any,
+            level: int | None,
+        ) -> None:
+            per_action = [item for item in raw_payload.get("per_action") or [] if isinstance(item, dict)]
+            executed_steps: set[int] = set()
+            for item in per_action:
+                try:
+                    step = int(item.get("action_num"))
+                except (TypeError, ValueError):
+                    continue
+                executed_steps.add(step)
+                self._step_flags[step] = {
+                    key: item.get(key) for key in ("board_changed", "level_completed", "game_over", "reward")
+                }
+            config = self._prediction_config
+            if config.auto_predict:
+                try:
+                    _frame, refreshed_history = load_runtime_state(state_path)
+                    transitions = grid_transitions_for_level(refreshed_history, level)
+                    for transition in transitions:
+                        transition["result"] = self._step_flags.get(int(transition["step"]), {})
+                    new_count = sum(1 for transition in transitions if transition["step"] in executed_steps)
+                    verdicts = auto_predict(
+                        transitions, change_fraction=config.hud_change_fraction, new_count=new_count
+                    )
+                except Exception as exc:  # noqa: BLE001 - auto-prediction must never break an action
+                    log.warning("auto prediction failed: %s", exc)
+                    verdicts = []
+                for verdict in verdicts:
+                    verdict["level"] = level
+                self._auto_entries.extend(verdicts)
+                call_auto.extend(verdicts)
+                if verdicts:
+                    compact_payload["auto_prediction"] = summarize_auto(
+                        verdicts, max_surprises_shown=config.max_surprises_shown
+                    )
+            if config.nudge_after_actions > 0:
+                if expect is not None:
+                    self._moves_without_expect = 0
+                else:
+                    self._moves_without_expect += max(1, len(per_action))
+                    if self._moves_without_expect >= config.nudge_after_actions:
+                        warning = (
+                            f"NO PREDICTION FOR LAST {self._moves_without_expect} MOVES "
+                            "\u2014 use expect= when testing an idea"
+                        )
+                        self._moves_without_expect = 0
+                        compact_payload["prediction_warning"] = warning
+                        call_warnings.append(warning)
 
         def _handle_action(actions: list[dict[str, Any]], expect: Any = None) -> dict[str, Any]:
             nonlocal terminal_action_result, current_level
@@ -1746,6 +1820,7 @@ class ToolAgent:
                         step_arguments.get("expect"),
                         level_before,
                     )
+                    _record_auto_and_nudge(compact_payload, raw_payload, step_arguments.get("expect"), level_before)
                 if self._level_memory is not None:
                     self._level_memory.record_transition_results(raw_payload.get("per_action"))
                     end_reason = _terminal_action_reason(compact_payload)
@@ -1819,6 +1894,28 @@ class ToolAgent:
                     ][: self._prediction_config.max_wrong_diffs_shown],
                 }
             )
+        if call_auto:
+            payload["auto_prediction"] = summarize_auto(
+                call_auto, max_surprises_shown=self._prediction_config.max_surprises_shown
+            )
+            self._layer_events.append(
+                {
+                    "type": "auto_prediction",
+                    "counts": {
+                        verdict: sum(1 for entry in call_auto if entry["verdict"] == verdict)
+                        for verdict in ("as_before", "surprise", "first_time")
+                    },
+                    "surprises": [
+                        line
+                        for entry in call_auto
+                        if entry["verdict"] == VERDICT_SURPRISE
+                        for line in entry["lines"]
+                    ][: self._prediction_config.max_surprises_shown],
+                }
+            )
+        if call_warnings:
+            payload["prediction_warning"] = call_warnings[-1]
+            self._layer_events.append({"type": "prediction_nudge", "warning": call_warnings[-1]})
         if self._level_memory is not None and sandbox_result.get("hypotheses"):
             recorded = self._level_memory.add_hypotheses(
                 sandbox_result.get("hypotheses"),

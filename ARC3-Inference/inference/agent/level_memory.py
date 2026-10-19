@@ -450,7 +450,7 @@ class LevelMemory:
         if any(counts.values()):
             parts.append(
                 f"predictions {counts.get('confirmed', 0)} confirmed / {counts.get('wrong', 0)} wrong / "
-                f"{counts.get('unchecked', 0)} unchecked;"
+                f"{counts.get('no_prediction', 0)} no_prediction;"
             )
         for key, label in (("promoted", "new facts"), ("refuted", "refuted"), ("unverified", "unverified")):
             ids = summary.get(key) or []

@@ -34,7 +34,7 @@ from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
     write_runtime_state,
 )
-from inference.agent.prediction import compare_expectation, unchecked_prediction
+from inference.agent.prediction import compare_expectation, no_prediction_result
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
@@ -748,7 +748,7 @@ class _HarnessGameSession:
                 result=final_payload,
             )
         except Exception as exc:
-            prediction = unchecked_prediction(f"check error: {type(exc).__name__}")
+            prediction = no_prediction_result(f"check error: {type(exc).__name__}")
         # Annotate the batch's last action event before it is flushed to the
         # append-only events sidecar, so the viewer can show the verdict.
         for event in reversed(self.viewer_events):

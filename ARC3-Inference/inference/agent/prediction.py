@@ -15,7 +15,7 @@ from inference.utils.segmentation import _ORTH, _object_hash
 
 VERDICT_CONFIRMED = "confirmed"
 VERDICT_WRONG = "wrong"
-VERDICT_UNCHECKED = "unchecked"
+VERDICT_NO_PREDICTION = "no_prediction"
 
 FLAG_KEYS = ("board_changed", "level_completed", "game_over")
 OBJECT_KEYS = ("moves", "appears", "disappears", "cells")
@@ -31,12 +31,13 @@ def _color_char(value: int) -> str:
     return ARC_COLOR_CHARS[max(0, min(15, int(value)))]
 
 
-def grid_components(grid: Any) -> list[dict[str, Any]]:
+def grid_components(grid: Any, *, with_cells: bool = False) -> list[dict[str, Any]]:
     """4-connected same-value components in the same id order as ``segment_layer``.
 
-    Only what the expectation checks need (id, color, hash, top-left, cells), so
-    the expensive containment pass of ``segment_layer`` is skipped. Ids and hashes
-    match what the model sees in ``current_frame.segmentation``.
+    Only what the expectation checks need (id, color, hash, top-left, pixels, and
+    the cell set when ``with_cells``), so the expensive containment pass of
+    ``segment_layer`` is skipped. Ids and hashes match what the model sees in
+    ``current_frame.segmentation``.
     """
     height = len(grid)
     width = len(grid[0]) if height else 0
@@ -66,6 +67,7 @@ def grid_components(grid: Any) -> list[dict[str, Any]]:
                     "hash": _object_hash(cells, color),
                     "top_left": (min(r for r, _ in cells), min(c for _, c in cells)),
                     "pixels": len(cells),
+                    **({"cells": cells} if with_cells else {}),
                 }
             )
     return components
@@ -237,7 +239,7 @@ def compare_expectation(
 
     ``result`` holds the real action flags (``board_changed``, ``level_completed``,
     ``game_over``, ``run_complete``). Returns a dict with ``verdict``
-    (confirmed/wrong/unchecked), ``failures`` (concrete expected-vs-observed
+    (confirmed/wrong/no_prediction), ``failures`` (concrete expected-vs-observed
     strings), ``checked`` (keys actually compared), ``skipped`` and ``note``.
     """
     normalized, problems = normalize_expectation(expect) if expect is not None else ({}, [])
@@ -345,7 +347,7 @@ def compare_expectation(
                 )
 
     if not checked:
-        verdict = VERDICT_UNCHECKED
+        verdict = VERDICT_NO_PREDICTION
     elif failures:
         verdict = VERDICT_WRONG
     else:
@@ -359,9 +361,9 @@ def compare_expectation(
     }
 
 
-def unchecked_prediction(reason: str = "") -> dict[str, Any]:
+def no_prediction_result(reason: str = "") -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "verdict": VERDICT_UNCHECKED,
+        "verdict": VERDICT_NO_PREDICTION,
         "failures": [],
         "checked": [],
         "skipped": [],
@@ -389,7 +391,7 @@ def _clip(text: str) -> str:
 
 def format_prediction_line(entry: dict[str, Any]) -> str:
     """One compact line, e.g. ``#12 RIGHT -> WRONG: moves[id 3]: moved [0,0], expected [0,1]``."""
-    verdict = str(entry.get("verdict") or VERDICT_UNCHECKED)
+    verdict = str(entry.get("verdict") or VERDICT_NO_PREDICTION)
     prefix = f"#{entry['action_num']} " if entry.get("action_num") is not None else ""
     head = f"{prefix}{_actions_label(list(entry.get('actions') or []))}"
     if verdict == VERDICT_WRONG:
@@ -397,14 +399,14 @@ def format_prediction_line(entry: dict[str, Any]) -> str:
     if verdict == VERDICT_CONFIRMED:
         return _clip(f"{head} -> confirmed ({','.join(entry.get('checked') or [])})")
     reason = "; ".join(entry.get("skipped") or []) or "no expect="
-    return _clip(f"{head} -> unchecked ({reason})")
+    return _clip(f"{head} -> no_prediction ({reason})")
 
 
 def prediction_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {VERDICT_CONFIRMED: 0, VERDICT_WRONG: 0, VERDICT_UNCHECKED: 0}
+    counts = {VERDICT_CONFIRMED: 0, VERDICT_WRONG: 0, VERDICT_NO_PREDICTION: 0}
     for entry in entries:
-        verdict = str(entry.get("verdict") or VERDICT_UNCHECKED)
-        counts[verdict if verdict in counts else VERDICT_UNCHECKED] += 1
+        verdict = str(entry.get("verdict") or VERDICT_NO_PREDICTION)
+        counts[verdict if verdict in counts else VERDICT_NO_PREDICTION] += 1
     return counts
 
 
@@ -414,13 +416,13 @@ def summarize_predictions(entries: list[dict[str, Any]], *, max_wrong_diffs_show
     if not entries:
         return []
     counts = prediction_counts(entries)
-    if counts[VERDICT_UNCHECKED] == len(entries):
-        return [f"{len(entries)} action() call(s), none passed expect= (unchecked)"]
+    if counts[VERDICT_NO_PREDICTION] == len(entries):
+        return [f"{len(entries)} action() call(s), none passed expect= (no_prediction)"]
     if len(entries) <= _MAX_FULL_LINES:
         return [format_prediction_line(entry) for entry in entries]
     lines = [
         f"{len(entries)} action() calls: {counts[VERDICT_CONFIRMED]} confirmed / "
-        f"{counts[VERDICT_WRONG]} wrong / {counts[VERDICT_UNCHECKED]} unchecked"
+        f"{counts[VERDICT_WRONG]} wrong / {counts[VERDICT_NO_PREDICTION]} no_prediction"
     ]
     wrong = [entry for entry in entries if entry.get("verdict") == VERDICT_WRONG]
     shown = wrong[: max(0, int(max_wrong_diffs_shown))]

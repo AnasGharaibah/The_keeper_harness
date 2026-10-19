@@ -67,7 +67,11 @@
     "prediction_check": {
       "enabled": true,
       "max_wrong_diffs_shown": 5,
-      "sandbox_log_size": 20
+      "sandbox_log_size": 20,
+      "nudge_after_actions": 5,
+      "auto_predict": true,
+      "hud_change_fraction": 0.8,
+      "max_surprises_shown": 3
     },
     "level_review": {
       "enabled": true,

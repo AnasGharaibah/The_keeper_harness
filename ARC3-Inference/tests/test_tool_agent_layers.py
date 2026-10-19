@@ -137,12 +137,12 @@ def test_prediction_check_block_in_tool_result(tmp_path):
     assert payload["prediction_check"] == [
         "#1 RIGHT -> confirmed (board_changed)",
         "#2 UP -> WRONG: board_changed=False, expected True",
-        "#3 UP -> unchecked (no expect=)",
+        "#3 UP -> no_prediction (no expect=)",
     ]
-    assert payload["result"] == ["unchecked", ["confirmed", "wrong", "unchecked"]]
-    (event,) = agent.drain_layer_events()
+    assert payload["result"] == ["no_prediction", ["confirmed", "wrong", "no_prediction"]]
+    (event,) = [event for event in agent.drain_layer_events() if event["type"] == "prediction_check"]
     assert event["type"] == "prediction_check"
-    assert event["counts"] == {"confirmed": 1, "wrong": 1, "unchecked": 1}
+    assert event["counts"] == {"confirmed": 1, "wrong": 1, "no_prediction": 1}
 
 
 def test_hypotheses_recorded_reviewed_and_pinned(tmp_path):
@@ -214,3 +214,45 @@ def test_finalize_reviews_level_in_progress(tmp_path):
     stats = json.loads(state_path.with_name("game_p0_facts.json").read_text())["level_stats"]
     assert stats[-1]["reason"] == "run_end"
     assert stats[-1]["llm"] == "disabled"
+
+
+BASELINE_PREDICTION = PredictionCheckConfig(enabled=True, auto_predict=False, nudge_after_actions=0)
+
+
+def test_new_prediction_switches_off_add_nothing(tmp_path):
+    agent = _agent(BASELINE_PREDICTION)
+    assert "SURPRISE" not in agent._system_prompt and "no_prediction" not in agent._system_prompt
+    state_path, _env = _setup(tmp_path, agent)
+    payload = _run(agent, state_path, "for _ in range(4):\n    action(['RIGHT'])\naction(['UP'])\naction(['UP'])")
+    assert "auto_prediction" not in payload and "prediction_warning" not in payload
+    assert [event["type"] for event in agent.drain_layer_events()] == ["prediction_check"]
+    assert agent._auto_entries == []
+
+
+def test_auto_prediction_reported_in_tool_result(tmp_path):
+    agent = _agent(ON_PREDICTION)
+    assert "SURPRISE:" in agent._system_prompt and "no_prediction" in agent._system_prompt
+    state_path, _env = _setup(tmp_path, agent)
+    payload = _run(agent, state_path, "action(['RIGHT'])\naction(['RIGHT'])\nresult = last_action_result['auto_prediction']")
+    assert payload["auto_prediction"][0].startswith("auto: 1 as before / 0 surprise / 1 first time")
+    assert payload["result"][0].startswith("auto: 1 as before")
+    assert [entry["source"] for entry in agent._auto_entries] == ["auto", "auto"]
+    # UP does nothing on this board; RIGHT moved last time, so a no-op RIGHT would surprise.
+    payload = _run(agent, state_path, "action(['UP'])\naction(['UP'])")
+    assert payload["auto_prediction"][0].startswith("auto: 1 as before / 0 surprise / 1 first time")
+    events = [event for event in agent.drain_layer_events() if event["type"] == "auto_prediction"]
+    assert len(events) == 2 and events[0]["counts"] == {"as_before": 1, "surprise": 0, "first_time": 1}
+
+
+def test_nudge_after_consecutive_moves_without_expect(tmp_path):
+    agent = _agent(PredictionCheckConfig(enabled=True, nudge_after_actions=3))
+    state_path, _env = _setup(tmp_path, agent)
+    payload = _run(agent, state_path, "action(['UP'])\naction(['UP'])")
+    assert "prediction_warning" not in payload
+    payload = _run(agent, state_path, "action(['UP'])")
+    assert payload["prediction_warning"].startswith("NO PREDICTION FOR LAST 3 MOVES")
+    # An expect= resets the counter.
+    payload = _run(agent, state_path, "action(['UP'])\naction(['UP'])\naction(['UP'], expect={'board_changed': False})")
+    assert "prediction_warning" not in payload
+    assert agent._moves_without_expect == 0
+    assert any(event["type"] == "prediction_nudge" for event in agent.drain_layer_events())

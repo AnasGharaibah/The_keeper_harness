@@ -41,13 +41,32 @@ class PredictionCheckConfig:
     enabled: bool = False
     max_wrong_diffs_shown: int = 5
     sandbox_log_size: int = 20
+    # Loud reminder after this many consecutive executed actions without expect= (0 = off).
+    nudge_after_actions: int = 5
+    # Harness predicts "same effect as the last same action on this level" (no LLM).
+    auto_predict: bool = True
+    # Cells changing in at least this fraction of a level's transitions are HUD and ignored.
+    hud_change_fraction: float = 0.8
+    max_surprises_shown: int = 3
 
     @classmethod
     def from_env(cls) -> "PredictionCheckConfig":
+        defaults = cls()
         return cls(
             enabled=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_ENABLED", False),
             max_wrong_diffs_shown=max(0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_MAX_WRONG_DIFFS", 5)),
             sandbox_log_size=max(0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_SANDBOX_LOG_SIZE", 20)),
+            nudge_after_actions=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_NUDGE_AFTER_ACTIONS", defaults.nudge_after_actions)
+            ),
+            auto_predict=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_AUTO_PREDICT", defaults.auto_predict),
+            hud_change_fraction=min(
+                1.0,
+                max(0.0, _env_float("LOCAL_ANALYZER_PREDICTION_CHECK_HUD_CHANGE_FRACTION", defaults.hud_change_fraction)),
+            ),
+            max_surprises_shown=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_MAX_SURPRISES_SHOWN", defaults.max_surprises_shown)
+            ),
         )
 
 
