@@ -152,8 +152,11 @@ Two harness layers are switchable from `analyzer.*` and default to off, so
 
 A/B configs: `configs/inference.json` (baseline),
 `configs/inference.layer1.json` (prediction check only), and
-`configs/inference.layers.json` (both layers). The layers are not wired into
-the Kaggle notebook template yet, so they are off on Kaggle.
+`configs/inference.layers.json` (all layers). On Kaggle the notebook setup
+forwards every `LOCAL_ANALYZER_PREDICTION_CHECK_*`, `LOCAL_ANALYZER_LEVEL_REVIEW_*`
+and `LOCAL_ANALYZER_WORLD_MODEL_*` value the launcher exported, so launch with
+`CONFIG_PATH=configs/inference.layers.json make kaggle-duck ...` to run the
+layers there; the default `configs/inference.json` keeps them off.
 
 To use a vLLM server on another machine, override the base URL:
 

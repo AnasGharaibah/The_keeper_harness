@@ -59,6 +59,13 @@ class DuckKaggleVllmConfig:
     wheelhouse_stamp_text: str = DEFAULT_WHEELHOUSE_STAMP_TEXT
 
 
+
+_LAYER_ENV_PREFIXES = (
+    "LOCAL_ANALYZER_PREDICTION_CHECK_",
+    "LOCAL_ANALYZER_LEVEL_REVIEW_",
+    "LOCAL_ANALYZER_WORLD_MODEL_",
+)
+
 def duck_kaggle_dataset_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
@@ -118,6 +125,16 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_ENABLE_THINKING__": repr(os.environ.get("LOCAL_ANALYZER_ENABLE_THINKING", "1")),
         "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
+        # Keeper layers (prediction check / auto-prediction / perception, level
+        # review, world model): pass every layer switch the launcher exported so
+        # the Kaggle run uses the same layer config as the launching JSON.
+        "__LAYER_ENV__": repr(
+            {
+                key: value
+                for key, value in sorted(os.environ.items())
+                if key.startswith(_LAYER_ENV_PREFIXES) and value != ""
+            }
+        ),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
     }
@@ -390,6 +407,7 @@ setup_env = {
     'LOCAL_ANALYZER_ENABLE_THINKING': __LOCAL_ANALYZER_ENABLE_THINKING__,
     'MULTIMODAL_CONTEXT': __MULTIMODAL_CONTEXT__,
     'MULTIMODAL_UPSCALE': __MULTIMODAL_UPSCALE__,
+    **__LAYER_ENV__,
 }
 setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])
 existing_setup_env = {}
