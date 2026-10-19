@@ -7,7 +7,9 @@ from dataclasses import dataclass
 
 from inference.utils.openai_compat import normalize_provider
 
-DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
+# Python 3.13 rebuild of driessmit1/arc3-vllm-h100-wheelhouse-v3 (same 174 pins);
+# Kaggle's image moved to Python 3.13 and the original holds cp312 wheels only.
+DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "anasgharaibah/keeper-vllm-wheelhouse-py313"
 DEFAULT_QWEN_MODEL_DATASET_SOURCE = "driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot"
 DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
