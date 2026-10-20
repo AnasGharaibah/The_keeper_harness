@@ -376,6 +376,12 @@ def _extract_last_notes_from_reasoning(reasoning: str) -> dict[str, str]:
     return found
 
 
+def _is_repeated_batch(actions: list[dict[str, Any]]) -> bool:
+    """One repeated action means the same action on the same cell; clicks on
+    different cells are a mixed batch."""
+    return len({(action_key(str(item.get("action") or "")), item.get("row"), item.get("col")) for item in actions}) == 1
+
+
 def _empty_world_model() -> dict[str, str]:
     return {
         "world_model": "",
@@ -1140,7 +1146,7 @@ class ToolAgent:
     ) -> Callable[[dict[str, Any], int, int], str | None]:
         """Per-action early-stop hook for one multi-action call (see HarnessSolver.step_env)."""
         config = self._prediction_config
-        repeated = len({action_key(str(item.get("action") or "")) for item in actions}) == 1
+        repeated = _is_repeated_batch(actions)
         state = {"blocked": 0}
 
         def check(payload: dict[str, Any], index: int, size: int) -> str | None:

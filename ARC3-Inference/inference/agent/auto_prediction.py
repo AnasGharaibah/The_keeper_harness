@@ -221,10 +221,26 @@ def effect_signature(item: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def is_toggle_back(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """The action exactly undid what it did last time (a toggle switched back):
+    what appeared then disappears now and vice versa, and every move is reversed."""
+    if not (previous["appeared"] or previous["disappeared"] or previous["moves"]):
+        return False
+    if set(current["appeared"]) != set(previous["disappeared"]):
+        return False
+    if set(current["disappeared"]) != set(previous["appeared"]):
+        return False
+    reversed_moves = {h: (-d[0], -d[1]) for h, d in previous["moves"].items()}
+    return current["moves"] == reversed_moves
+
+
 def _surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) -> list[tuple[tuple[str, str], str]]:
-    """(kind, text) pairs; kind = (category, object) so a batch can show one line per distinct kind."""
+    """(kind, text) pairs; kind = (category, object) so a batch can show one line per distinct kind.
+    A toggle switching back is the expected alternation, not a surprise."""
     colors = {**previous["colors"], **current["colors"]}
     found: list[tuple[tuple[str, str], str]] = []
+    if not (current["level_completed"] or current["game_over"]) and is_toggle_back(previous, current):
+        return found
     for key in ("level_completed", "game_over"):
         if current[key] and not previous[key]:
             found.append(((key, ""), f"SURPRISE: {action} caused {key} (it did not last time)"))

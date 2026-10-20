@@ -66,9 +66,10 @@ def test_timer_cell_is_detected_as_hud_and_ignored():
 def test_hud_needs_enough_transitions():
     transitions = [_t("UP", 0, 0, 1), _t("UP", 0, 0, 2)]
     assert hud_mask(transitions, change_fraction=0.8) == set()
-    # Too early to call the timer HUD, so its flip still reads as a surprise.
+    # Too early to call the timer HUD, but its flip back is a toggle switching back,
+    # which is not a surprise either.
     (verdict,) = auto_predict(transitions, change_fraction=0.8)
-    assert verdict["verdict"] == VERDICT_SURPRISE
+    assert verdict["verdict"] == VERDICT_AS_BEFORE
 
 
 def test_level_completed_is_a_surprise_when_new():

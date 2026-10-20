@@ -238,3 +238,27 @@ def test_reset_steps_are_excluded_from_hypothesis_transitions_and_labelled_for_t
 def test_perception_ignores_reset_transitions():
     tracker = PerceptionTracker(min_size=3)
     assert tracker.observe(_t("RIGHT", _board(3), _board(0), 1), set(), level=1, reset=True) == []
+
+
+# ----- fixes after the tn36 run: click coordinates and toggles --------------------
+
+
+def test_clicks_on_different_cells_are_a_mixed_batch():
+    from inference.agent.tool_agent import _is_repeated_batch
+
+    assert _is_repeated_batch([{"action": "MOUSE", "row": 4, "col": 2}, {"action": "MOUSE", "row": 4, "col": 2}])
+    assert not _is_repeated_batch([{"action": "MOUSE", "row": 4, "col": 2}, {"action": "MOUSE", "row": 4, "col": 6}])
+    assert _is_repeated_batch([{"action": "LEFT"}] * 5)
+    assert not _is_repeated_batch([{"action": "LEFT"}, {"action": "UP"}])
+
+
+def test_a_toggle_switching_back_is_not_a_surprise():
+    off = _board(0)
+    on = _board(0, extra={(6, 6): 4, (6, 7): 4, (7, 6): 4, (7, 7): 4})
+    transitions = [
+        _t("MOUSE(row=6, col=6)", off, on, 1),
+        _t("MOUSE(row=6, col=6)", on, off, 2),
+        _t("MOUSE(row=6, col=6)", off, on, 3),
+    ]
+    verdicts = auto_predict(transitions, change_fraction=0.8, new_count=2)
+    assert [v["verdict"] for v in verdicts] == ["as_before", "as_before"]
