@@ -31,6 +31,7 @@ from inference.utils.animation import (
 from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
+    KEEPER_SURPRISE_ADDENDUM,
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
     COMPACT_TOOL_SESSION_ADDENDUM,
@@ -67,6 +68,9 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent import keeper_auto
+from inference.agent.keeper_config import KeeperConfig
+from inference.utils.grid_utils import ARC_COLOR_CHARS
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
@@ -2714,6 +2718,9 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         # either way - this only controls whether the model is told about it,
         # so the arm measures whether knowing costs more than it returns.
         prompt += FRAME_DIFF_HINT_ADDENDUM
+    _keeper = KeeperConfig.from_env()
+    if _keeper.surprise:
+        prompt += KEEPER_SURPRISE_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
         prompt += STEP_VERIFICATION_ADDENDUM
@@ -3502,6 +3509,7 @@ class ToolAgent:
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
         )
+        self._keeper = KeeperConfig.from_env()
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -5389,6 +5397,47 @@ class ToolAgent:
             return [self._summarize_planned_actions(item) for item in value]
         return value
 
+    def _keeper_observe(self, state_path: Path, start_frame: Frame | None, payload: dict[str, Any]) -> None:
+        """Keeper: add SURPRISE lines for the actions this tool call executed.
+        Only called when a Keeper observation switch is on. Never raises."""
+        keeper = self._keeper
+        try:
+            _frame, history = load_runtime_state(state_path)
+            start_step = start_frame.step if start_frame is not None else -1
+            new_steps = [
+                entry.frame.step
+                for entry in history
+                if entry.frame is not None
+                and entry.frame.step > start_step
+                and not keeper_auto.action_key(entry.action).startswith("RESET")
+            ]
+            if not new_steps:
+                return
+            levels = sorted(
+                {
+                    history[index - 1].frame.level
+                    for index in range(1, len(history))
+                    if history[index].frame is not None
+                    and history[index].frame.step in set(new_steps)
+                    and history[index - 1].frame is not None
+                }
+            )
+            if keeper.surprise:
+                lines: list[str] = []
+                for level in levels:
+                    transitions = keeper_auto.level_transitions(history, level)
+                    lines += keeper_auto.surprise_lines(
+                        transitions,
+                        [t["step"] for t in transitions if t["step"] in set(new_steps)],
+                        border=keeper.border,
+                        max_lines=keeper.surprise_max_lines - len(lines),
+                        color_chars=ARC_COLOR_CHARS,
+                    ) if len(lines) < keeper.surprise_max_lines else []
+                if lines:
+                    payload["surprises"] = lines
+        except Exception as exc:  # noqa: BLE001 - an observation must never break a tool call
+            log.warning("keeper observation failed: %s", exc)
+
     def _render_tool_payload(self, payload: dict[str, Any], *, truncate_fields: tuple[str, ...] = ()) -> str:
         result = self._summarize_planned_actions(dict(payload))
         truncated = False
@@ -5933,6 +5982,9 @@ class ToolAgent:
                     }
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
+        keeper = getattr(self, "_keeper", None)
+        if step_executed and keeper is not None and keeper.any_observation:
+            self._keeper_observe(state_path, current_frame, payload)
         made_progress = any(
             bool(item.get("gameplay_changed"))
             or bool(item.get("level_completed"))
