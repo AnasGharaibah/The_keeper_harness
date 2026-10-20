@@ -646,6 +646,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     if t.before_frame is not None
                     and t.before_frame.level == level
                     and parse_action(t.action)[0] != "RESET"
+                    and not (t.result or {}).get("reset")
                 ]
                 started = time.monotonic()
                 reply["quick_check"] = _evaluate_check(

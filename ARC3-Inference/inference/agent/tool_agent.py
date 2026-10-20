@@ -15,8 +15,11 @@ import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
 from inference.agent.auto_prediction import (
+    VERDICT_RESET,
     VERDICT_SURPRISE,
+    action_key,
     auto_predict,
+    batch_summary,
     grid_transitions_for_level,
     hud_mask,
     summarize_auto,
@@ -32,6 +35,7 @@ from inference.agent.prediction import (
 )
 from inference.agent.prompts import (
     AUTO_PREDICTION_ADDENDUM,
+    BATCH_ADDENDUM,
     PERCEPTION_ADDENDUM,
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
@@ -431,6 +435,7 @@ def _build_system_prompt(
     auto_predict: bool = False,
     world_model: bool = False,
     perception: bool = False,
+    batch: bool = False,
 ) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -445,6 +450,8 @@ def _build_system_prompt(
             prompt += AUTO_PREDICTION_ADDENDUM
             if perception:
                 prompt += PERCEPTION_ADDENDUM
+            if batch:
+                prompt += BATCH_ADDENDUM
     if level_review:
         prompt += LEVEL_REVIEW_ADDENDUM
     if world_model:
@@ -1053,6 +1060,7 @@ class ToolAgent:
             auto_predict=self._prediction_config.auto_predict,
             world_model=self._world_model_config.enabled,
             perception=self._prediction_config.perception,
+            batch=self._prediction_config.batch_summary or self._prediction_config.batch_stop,
         )
         self._tool_description = (
             _PYTHON_TOOL_DESCRIPTION
@@ -1126,6 +1134,44 @@ class ToolAgent:
                 if self._review_config.enabled
                 else None
             )
+
+    def _batch_continue_check(
+        self, state_path: Path, level: int | None, actions: list[dict[str, Any]]
+    ) -> Callable[[dict[str, Any], int, int], str | None]:
+        """Per-action early-stop hook for one multi-action call (see HarnessSolver.step_env)."""
+        config = self._prediction_config
+        repeated = len({action_key(str(item.get("action") or "")) for item in actions}) == 1
+        state = {"blocked": 0}
+
+        def check(payload: dict[str, Any], index: int, size: int) -> str | None:
+            _frame, history = load_runtime_state(state_path)
+            transitions = grid_transitions_for_level(history, level)
+            if not transitions:
+                return None
+            for transition in transitions:
+                transition["result"] = dict(self._step_flags.get(int(transition["step"]), {}))
+            transitions[-1]["result"].update(
+                {key: payload.get(key) for key in ("level_completed", "game_over") if key in payload}
+            )
+            (verdict,) = auto_predict(
+                transitions,
+                change_fraction=config.hud_change_fraction,
+                new_count=1,
+                reset_detection=config.reset_detection,
+            )
+            if verdict["verdict"] == VERDICT_RESET:
+                return "RESET detected (board back to level start)" if config.stop_on_reset else None
+            state["blocked"] = state["blocked"] + 1 if verdict.get("blocked") else 0
+            if config.stop_after_blocked and state["blocked"] >= config.stop_after_blocked:
+                return f"blocked {state['blocked']} times in a row"
+            if verdict["verdict"] == VERDICT_SURPRISE and (
+                (repeated and config.stop_on_surprise_repeated) or (not repeated and config.stop_on_surprise_mixed)
+            ):
+                first = verdict["lines"][0] if verdict.get("lines") else "SURPRISE"
+                return first[len("SURPRISE: "):] if first.startswith("SURPRISE: ") else first
+            return None
+
+        return check
 
     def _new_perception_tracker(self) -> PerceptionTracker | None:
         config = self._prediction_config
@@ -1210,6 +1256,7 @@ class ToolAgent:
                     self._prediction_config.perception_max_lines if self._perception is not None else 0
                 ),
                 perception_min_size=self._prediction_config.perception_min_size,
+                reset_detection=self._prediction_config.enabled and self._prediction_config.reset_detection,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must never stop play
             log.warning("level review failed: %s", exc)
@@ -1834,12 +1881,16 @@ class ToolAgent:
 
         call_auto: list[dict[str, Any]] = []
         call_warnings: list[str] = []
+        call_batch_summaries: list[str] = []
+        call_batch_stops: list[str] = []
+        reset_steps: set[int] = set()
 
         def _record_auto_and_nudge(
             compact_payload: dict[str, Any],
             raw_payload: dict[str, Any],
             expect: Any,
             level: int | None,
+            requested_count: int = 1,
         ) -> None:
             per_action = [item for item in raw_payload.get("per_action") or [] if isinstance(item, dict)]
             executed_steps: set[int] = set()
@@ -1861,12 +1912,22 @@ class ToolAgent:
                         transition["result"] = self._step_flags.get(int(transition["step"]), {})
                     new_count = sum(1 for transition in transitions if transition["step"] in executed_steps)
                     verdicts = auto_predict(
-                        transitions, change_fraction=config.hud_change_fraction, new_count=new_count
+                        transitions,
+                        change_fraction=config.hud_change_fraction,
+                        new_count=new_count,
+                        reset_detection=config.reset_detection,
                     )
+                    for position, verdict in enumerate(verdicts, start=1):
+                        verdict["batch"] = (position, max(requested_count, len(verdicts)))
+                        if verdict["verdict"] == VERDICT_RESET and verdict.get("step") is not None:
+                            reset_steps.add(int(verdict["step"]))
+                            self._step_flags.setdefault(int(verdict["step"]), {})["reset"] = True
                     if self._perception is not None and verdicts:
                         mask = hud_mask(transitions, change_fraction=config.hud_change_fraction)
                         for verdict, transition in zip(verdicts, transitions[len(transitions) - len(verdicts) :]):
-                            verdict["perception"] = self._perception.observe(transition, mask, level=level)
+                            verdict["perception"] = self._perception.observe(
+                                transition, mask, level=level, reset=verdict["verdict"] == VERDICT_RESET
+                            )
                 except Exception as exc:  # noqa: BLE001 - auto-prediction must never break an action
                     log.warning("auto prediction failed: %s", exc)
                     verdicts = []
@@ -1880,6 +1941,10 @@ class ToolAgent:
                         max_surprises_shown=config.max_surprises_shown,
                         max_perception_shown=2 * config.perception_max_lines,
                     )
+                if config.batch_summary and len(verdicts) > 1:
+                    summary_line = batch_summary(verdicts, max_chars=config.batch_summary_max_chars)
+                    compact_payload["batch_summary"] = summary_line
+                    call_batch_summaries.append(summary_line)
             if config.nudge_after_actions > 0:
                 if expect is not None:
                     self._moves_without_expect = 0
@@ -1931,6 +1996,15 @@ class ToolAgent:
             step_arguments: dict[str, Any] = {"actions": normalized_actions}
             if self._prediction_config.enabled and expect is not None:
                 step_arguments["expect"] = expect
+            if (
+                self._prediction_config.enabled
+                and self._prediction_config.auto_predict
+                and self._prediction_config.batch_stop
+                and len(normalized_actions) > 1
+            ):
+                step_arguments["continue_check"] = self._batch_continue_check(
+                    state_path, current_level, normalized_actions
+                )
             raw_payload = self._step_env_callback(step_arguments)
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
@@ -1944,9 +2018,27 @@ class ToolAgent:
                         step_arguments.get("expect"),
                         level_before,
                     )
-                    _record_auto_and_nudge(compact_payload, raw_payload, step_arguments.get("expect"), level_before)
+                    _record_auto_and_nudge(
+                        compact_payload,
+                        raw_payload,
+                        step_arguments.get("expect"),
+                        level_before,
+                        requested_count=len(normalized_actions),
+                    )
+                if compact_payload.get("stop_reason") == "early_stop":
+                    executed_count = int(compact_payload.get("executed_count") or 1)
+                    requested = int(compact_payload.get("requested_count") or len(normalized_actions))
+                    message = (
+                        f"BATCH STOPPED at step {compact_payload.get('action_num')} ({executed_count}/{requested}): "
+                        f"{compact_payload.get('stop_detail')} \u2014 {requested - executed_count} actions not executed"
+                    )
+                    compact_payload["batch_stopped"] = message
+                    call_batch_stops.append(message)
+                    self._layer_events.append({"type": "batch_stopped", "message": message})
                 if self._level_memory is not None:
                     self._level_memory.record_transition_results(raw_payload.get("per_action"))
+                    for step in sorted(reset_steps):
+                        self._level_memory.mark_reset(step)
                     end_reason = _terminal_action_reason(compact_payload)
                     if end_reason in {"level_completed", "game_over", "run_complete"}:
                         self._level_memory.mark_review_pending(level_before, end_reason)
@@ -2055,6 +2147,10 @@ class ToolAgent:
                     ],
                 }
             )
+        if call_batch_summaries:
+            payload["batch_summary"] = call_batch_summaries if len(call_batch_summaries) > 1 else call_batch_summaries[0]
+        if call_batch_stops:
+            payload["batch_stopped"] = call_batch_stops if len(call_batch_stops) > 1 else call_batch_stops[0]
         if call_warnings:
             payload["prediction_warning"] = call_warnings[-1]
             self._layer_events.append({"type": "prediction_nudge", "warning": call_warnings[-1]})

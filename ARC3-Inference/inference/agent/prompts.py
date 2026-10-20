@@ -118,6 +118,11 @@ LEVEL_REVIEW_ADDENDUM = (
     "- After each level the harness runs every check on all of that level's transitions. A claim becomes a VERIFIED FACT only if its check passes, applies to enough transitions, and fails on harness-perturbed transitions. Facts stay pinned at the top of your context across levels; facts that later fail move to REFUTED.\n"
 )
 
+BATCH_ADDENDUM = (
+    "- A multi-action call reports `batch_summary`: what each run of actions did, e.g. `LEFT x15: blocked -> step 48: RESET (board back to level start) -> LEFT x3: moved [0,-5] each`. `blocked` means nothing changed outside the HUD; a RESET is the level restarting (e.g. the step budget ran out), not an effect of the action.\n"
+    "- A batch can be stopped early (`batch_stopped`) when the level resets, a move is blocked twice in a row, or a repeated action does something surprising. The remaining actions were NOT executed: re-plan from the current state.\n"
+)
+
 PERCEPTION_ADDENDUM = (
     "- `auto_prediction` also lists what the harness perceives: objects that were ROTATED / FLIPPED / SCALED / RECOLORED, an object that starts or stops MATCHING another object's shape (up to rotation and scale), and ROLES (which objects move with the arrow keys and which never do). These are observations, not explanations: work out what caused them and whether they matter for the goal.\n"
 )

@@ -483,7 +483,7 @@ def test_merged_move_lines_merge_repeats_cap_and_keep_final_move():
     lines = merged_move_lines(history, 1, {}, hud_change_fraction=0.8, max_lines=60)
     assert lines[0].startswith("steps 1-3 RIGHT x3:") and lines[0].endswith("each")
     assert "moved [0,1]" in lines[0]
-    assert lines[1] == "step 4 UP: no board change (HUD ignored)"
+    assert lines[1] == "step 4 UP: blocked"
     capped = merged_move_lines(history, 1, {8: {"level_completed": True}}, hud_change_fraction=0.8, max_lines=3)
     assert capped[0] == "... 3 earlier move groups omitted"
     assert len(capped) == 4 and capped[-1] == "step 8 UP: level completed"

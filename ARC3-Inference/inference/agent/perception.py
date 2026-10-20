@@ -357,15 +357,21 @@ class PerceptionTracker:
             self._cache[key] = frame_objects(grid, mask, min_size=self.min_size)
         return self._cache[key]
 
-    def observe(self, transition: dict[str, Any], mask: set[Cell], *, level: int | None = None) -> list[str]:
+    def observe(
+        self, transition: dict[str, Any], mask: set[Cell], *, level: int | None = None, reset: bool = False
+    ) -> list[str]:
         """Lines for one transition (``action``, ``before``/``after`` int grids, ``result``),
-        at most ``max_lines``: relations first, then transformations, then roles."""
+        at most ``max_lines``: relations first, then transformations, then roles. A RESET
+        transition is not perceived as transformations; it only re-bases the relations."""
         if level != self.level:
             self._reset(level)
         before = self._objects(transition["before"], mask)
         after = self._objects(transition["after"], mask)
         result = transition.get("result") or {}
         if result.get("level_completed") or result.get("game_over"):
+            return []
+        if reset or result.get("reset"):
+            self._relations = relation_state(after)
             return []
 
         transformed = detect_transformations(before, after)
@@ -512,10 +518,14 @@ def replay_level(
     level: int | None,
     min_size: int,
     max_lines: int,
+    resets: set[int] | None = None,
 ) -> list[list[str]]:
-    """Perception lines for every transition of one level, in order."""
+    """Perception lines for every transition of one level, in order (none for RESET moves)."""
     tracker = PerceptionTracker(min_size=min_size, max_lines=max_lines)
-    return [tracker.observe(item, mask, level=level) for item in transitions]
+    return [
+        tracker.observe(item, mask, level=level, reset=index in (resets or set()))
+        for index, item in enumerate(transitions)
+    ]
 
 
 __all__ = [

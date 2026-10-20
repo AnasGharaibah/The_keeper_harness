@@ -18,8 +18,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from inference.agent.auto_prediction import (
+    RESET_LABEL,
     VERDICT_SURPRISE,
     describe_effect,
+    detect_resets,
+    short_effect,
     effect,
     effect_signature,
     grid_transitions_for_level,
@@ -113,6 +116,10 @@ def level_transitions(
         after = history[index].frame
         action = history[index].action
         if before.level != level or not action or _base_action(action) == "RESET":
+            continue
+        # A detected in-level reset is the level restarting, not an action effect:
+        # hypothesis checks never see it.
+        if (results_by_step.get(after.step) or {}).get("reset"):
             continue
         items.append(
             {
@@ -247,44 +254,57 @@ def merged_move_lines(
     max_lines: int,
     perception_max_lines: int = 0,
     perception_min_size: int = 3,
+    reset_detection: bool = False,
 ) -> list[str]:
-    """Per-move effect summaries for one level: consecutive identical effects of the
-    same action are merged (``RIGHT x7: ... each``); keeps the last ``max_lines``
-    lines and always the final move. With ``perception_max_lines`` > 0 the
-    perception lines of each move are appended (and such moves are never merged)."""
+    """Per-move summaries for one level, in the same terms as the batch summary the
+    agent sees: runs of the same action with the same effect are merged
+    (``steps 33-47 LEFT x15: blocked``), RESET moves get their own line and are never
+    described as an action effect. Keeps the last ``max_lines`` lines and always the
+    final move; with ``perception_max_lines`` > 0 each move's perception lines are
+    appended (and such moves are never merged)."""
     transitions = grid_transitions_for_level(history, level)
     for item in transitions:
         item["result"] = dict(results_by_step.get(int(item["step"])) or {})
     if not transitions:
         return []
     mask = hud_mask(transitions, change_fraction=hud_change_fraction)
+    resets = {i for i, item in enumerate(transitions) if item["result"].get("reset")}
+    if reset_detection:
+        resets |= detect_resets(transitions, mask)
     perceived: list[list[str]] = [[] for _ in transitions]
     if perception_max_lines > 0:
         perceived = replay_level(
-            transitions, mask, level=level, min_size=perception_min_size, max_lines=perception_max_lines
+            transitions, mask, level=level, min_size=perception_min_size, max_lines=perception_max_lines, resets=resets
         )
-    groups: list[list[Any]] = []  # [action, signature, description, count, first_step, last_step]
-    for item, lines in zip(transitions, perceived):
+    groups: list[list[Any]] = []  # [action, key, description, count, first_step, last_step]
+    for index, (item, lines) in enumerate(zip(transitions, perceived)):
+        action = str(item["action"])
+        if index in resets:
+            groups.append([action, None, f"{RESET_LABEL} -- not an effect of {action}", 1, item["step"], item["step"]])
+            continue
         item_effect = effect(item, mask)
-        signature = (str(item["action"]), effect_signature(item_effect), tuple(lines))
-        if groups and groups[-1][1] == signature:
+        label = short_effect(item_effect)
+        key = (action, label, effect_signature(item_effect) if label != "blocked" else None, tuple(lines))
+        if groups and groups[-1][1] == key:
             groups[-1][3] += 1
             groups[-1][5] = item["step"]
             continue
-        description = describe_effect(item_effect)
+        plain = label in ("blocked", "level completed", "game over")
+        description = label if plain else f"{label} ({describe_effect(item_effect)})"
         if lines:
             description += " | PERCEIVED: " + " / ".join(lines)
-        groups.append([str(item["action"]), signature, description, 1, item["step"], item["step"]])
-    lines = []
-    for action, _signature, description, count, first, last in groups:
+        groups.append([action, key, description, 1, item["step"], item["step"]])
+    out = []
+    for action, _key, description, count, first, last in groups:
         if count == 1:
-            lines.append(f"step {first} {action}: {description}")
+            out.append(f"step {first} {action}: {description}")
         else:
-            lines.append(f"steps {first}-{last} {action} x{count}: {description} each")
-    if len(lines) > max_lines:
-        omitted = len(lines) - max_lines
-        lines = [f"... {omitted} earlier move groups omitted", *lines[-max_lines:]]
-    return lines
+            each = "" if description in ("blocked", "level completed", "game over") else " each"
+            out.append(f"steps {first}-{last} {action} x{count}: {description}{each}")
+    if len(out) > max_lines:
+        omitted = len(out) - max_lines
+        out = [f"... {omitted} earlier move groups omitted", *out[-max_lines:]]
+    return out
 
 
 class LevelMemory:
@@ -305,6 +325,7 @@ class LevelMemory:
         self.last_review: dict[str, Any] | None = None
         # (perception_max_lines, perception_min_size) for the review's move summaries; 0 lines = off.
         self._perception: tuple[int, int] = (0, 3)
+        self._reset_detection = False
 
     # ----- recording ---------------------------------------------------
 
@@ -316,11 +337,17 @@ class LevelMemory:
                 step = int(item.get("action_num"))
             except (TypeError, ValueError):
                 continue
+            previous = self._results_by_step.get(step) or {}
             self._results_by_step[step] = {
                 key: item.get(key)
                 for key in ("board_changed", "level_completed", "game_over", "run_complete", "reward")
                 if key in item
             }
+            if previous.get("reset"):
+                self._results_by_step[step]["reset"] = True
+
+    def mark_reset(self, step: int) -> None:
+        self._results_by_step.setdefault(int(step), {})["reset"] = True
 
     def transition_results_payload(self) -> dict[str, dict[str, Any]]:
         return {str(step): dict(result) for step, result in self._results_by_step.items()}
@@ -415,9 +442,11 @@ class LevelMemory:
         hud_change_fraction: float = 0.8,
         perception_max_lines: int = 0,
         perception_min_size: int = 3,
+        reset_detection: bool = False,
     ) -> list[dict[str, Any]]:
         deadline = time.monotonic() + max(0.0, float(time_budget_seconds))
         self._perception = (perception_max_lines, perception_min_size)
+        self._reset_detection = reset_detection
         summaries: list[dict[str, Any]] = []
         pending, self._pending = self._pending, []
         for level, reason in pending:
@@ -597,6 +626,7 @@ class LevelMemory:
             max_lines=self.config.max_review_moves,
             perception_max_lines=perception_max_lines,
             perception_min_size=perception_min_size,
+            reset_detection=self._reset_detection,
         )
         messages = self.build_post_level_messages(level, reason, transitions, moves, surprises, level_predictions, candidates)
         try:

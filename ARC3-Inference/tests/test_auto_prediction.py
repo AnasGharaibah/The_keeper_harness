@@ -89,4 +89,4 @@ def test_new_count_covers_a_batch():
     assert [v["verdict"] for v in verdicts] == [VERDICT_FIRST_TIME, VERDICT_AS_BEFORE, VERDICT_SURPRISE]
     lines = summarize_auto(verdicts, max_surprises_shown=3)
     assert lines[0].startswith("auto: 1 as before / 1 surprise / 1 first time")
-    assert any(line.startswith("SURPRISE: RIGHT") for line in lines)
+    assert any(line.startswith("SURPRISE at step 3 (RIGHT): RIGHT") for line in lines)

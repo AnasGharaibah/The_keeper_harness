@@ -47,11 +47,22 @@ class PredictionCheckConfig:
     auto_predict: bool = True
     # Cells changing in at least this fraction of a level's transitions are HUD and ignored.
     hud_change_fraction: float = 0.8
-    max_surprises_shown: int = 3
+    max_surprises_shown: int = 5  # distinct surprise kinds shown per call
     # Perception lines (transformations, shape matches, roles) in auto_prediction.
     perception: bool = True
     perception_min_size: int = 3
     perception_max_lines: int = 3
+    # Label in-level resets (board back to level start) as RESET, never as an action effect.
+    reset_detection: bool = True
+    # Per-step summary of multi-action calls ("LEFT x15: blocked -> step 48: RESET -> ...").
+    batch_summary: bool = True
+    batch_summary_max_chars: int = 400
+    # Early stop of a multi-action call; the remaining actions are not sent to the game.
+    batch_stop: bool = True
+    stop_on_reset: bool = True
+    stop_after_blocked: int = 2  # consecutive blocked moves (0 = off)
+    stop_on_surprise_repeated: bool = True  # batch of one repeated action
+    stop_on_surprise_mixed: bool = False  # batch of mixed actions
 
     @classmethod
     def from_env(cls) -> "PredictionCheckConfig":
@@ -77,6 +88,22 @@ class PredictionCheckConfig:
             ),
             perception_max_lines=max(
                 0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION_MAX_LINES", defaults.perception_max_lines)
+            ),
+            reset_detection=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_RESET_DETECTION", defaults.reset_detection),
+            batch_summary=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_SUMMARY", defaults.batch_summary),
+            batch_summary_max_chars=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_SUMMARY_MAX_CHARS", defaults.batch_summary_max_chars)
+            ),
+            batch_stop=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_STOP", defaults.batch_stop),
+            stop_on_reset=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_RESET", defaults.stop_on_reset),
+            stop_after_blocked=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_STOP_AFTER_BLOCKED", defaults.stop_after_blocked)
+            ),
+            stop_on_surprise_repeated=_env_bool(
+                "LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_SURPRISE_REPEATED", defaults.stop_on_surprise_repeated
+            ),
+            stop_on_surprise_mixed=_env_bool(
+                "LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_SURPRISE_MIXED", defaults.stop_on_surprise_mixed
             ),
         )
 
