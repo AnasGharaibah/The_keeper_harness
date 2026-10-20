@@ -31,6 +31,7 @@ from inference.utils.animation import (
 from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
+    KEEPER_PERCEPTION_ADDENDUM,
     KEEPER_REVIEW_ADDENDUM,
     KEEPER_SURPRISE_ADDENDUM,
     apply_level_transfer_system_guidance,
@@ -69,7 +70,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent import keeper_auto, keeper_review
+from inference.agent import keeper_auto, keeper_perception, keeper_review
 from inference.agent.keeper_check_sandbox import run_check as keeper_run_check
 from inference.agent.keeper_config import KeeperConfig
 from inference.utils.grid_utils import ARC_COLOR_CHARS
@@ -2725,6 +2726,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += KEEPER_SURPRISE_ADDENDUM
     if _keeper.review:
         prompt += KEEPER_REVIEW_ADDENDUM
+    if _keeper.perception:
+        prompt += KEEPER_PERCEPTION_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
         prompt += STEP_VERIFICATION_ADDENDUM
@@ -5533,7 +5536,7 @@ class ToolAgent:
         append_transcript("KEEPER REVIEW", json.dumps(summary, default=str))
 
     def _keeper_observe(self, state_path: Path, start_frame: Frame | None, payload: dict[str, Any]) -> None:
-        """Keeper: add SURPRISE lines for the actions this tool call executed.
+        """Keeper: add SURPRISE and perception lines for the actions this tool call executed.
         Only called when a Keeper observation switch is on. Never raises."""
         keeper = self._keeper
         try:
@@ -5570,6 +5573,21 @@ class ToolAgent:
                     ) if len(lines) < keeper.surprise_max_lines else []
                 if lines:
                     payload["surprises"] = lines
+            if keeper.perception:
+                tracker = getattr(self, "_keeper_perception", None)
+                if tracker is None or getattr(self, "_keeper_perception_dir", None) != state_path.parent:
+                    tracker = keeper_perception.PerceptionTracker(
+                        min_size=keeper.perception_min_size, max_lines=keeper.perception_max_lines
+                    )
+                    self._keeper_perception = tracker
+                    self._keeper_perception_dir = state_path.parent
+                perceived: list[str] = []
+                for level in levels:
+                    for transition in keeper_auto.level_transitions(history, level):
+                        if transition["step"] in set(new_steps):
+                            perceived += tracker.observe(transition, set(), level=level)
+                if perceived:
+                    payload["perceived"] = perceived[: keeper.perception_max_lines]
         except Exception as exc:  # noqa: BLE001 - an observation must never break a tool call
             log.warning("keeper observation failed: %s", exc)
 

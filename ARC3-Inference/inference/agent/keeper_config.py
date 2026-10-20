@@ -60,10 +60,15 @@ class KeeperConfig:
     review_max_open: int = 10
     review_check_timeout_seconds: int = 10
     facts_min_support: int = 2
+    # Perception lines for what frame_diff() does not report: whole-pattern
+    # rotations/flips/scale, shape matches between objects, and player roles.
+    perception: bool = False
+    perception_max_lines: int = 3
+    perception_min_size: int = 3
 
     @property
     def any_observation(self) -> bool:
-        return self.surprise
+        return self.surprise or self.perception
 
     @classmethod
     def from_env(cls) -> "KeeperConfig":
@@ -86,4 +91,7 @@ class KeeperConfig:
                 1, _env_int("KEEPER_REVIEW_CHECK_TIMEOUT_SECONDS", defaults.review_check_timeout_seconds)
             ),
             facts_min_support=max(1, _env_int("KEEPER_FACTS_MIN_SUPPORT", defaults.facts_min_support)),
+            perception=_env_bool("KEEPER_PERCEPTION", defaults.perception),
+            perception_max_lines=max(1, _env_int("KEEPER_PERCEPTION_MAX_LINES", defaults.perception_max_lines)),
+            perception_min_size=max(1, _env_int("KEEPER_PERCEPTION_MIN_SIZE", defaults.perception_min_size)),
         )

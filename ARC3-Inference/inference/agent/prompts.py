@@ -238,6 +238,12 @@ KEEPER_REVIEW_ADDENDUM = (
     "verified against your recorded moves, and unverified ideas from a short review of that level.\n"
 )
 
+KEEPER_PERCEPTION_ADDENDUM = (
+    "- `perceived` in the tool result reports a whole pattern that rotated, flipped or changed scale, "
+    "an object whose shape starts or stops matching another object (up to rotation and scale), "
+    "and which objects move with the arrow keys.\n"
+)
+
 FRAME_DIFF_HINT_ADDENDUM = (
     "- `frame_diff(before=None, after=None)` compares two frames. Omitted arguments default to `previous_frame` and `current_frame`, respectively.\n"
     "- It returns a dictionary containing `changed_cell_count` (an integer) and lists named `moved`, `rotated`, `appeared`, `disappeared`, `changed_color`, and `resized`. Unchanged objects are omitted.\n"
