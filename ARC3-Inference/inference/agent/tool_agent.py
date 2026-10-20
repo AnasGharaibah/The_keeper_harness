@@ -5466,10 +5466,17 @@ class ToolAgent:
             block = memory.notes_block()
             if not block:
                 return user_prompt
+            def _text(message: dict[str, Any]) -> str:
+                content = message.get("content")
+                if isinstance(content, str):
+                    return content
+                # multimodal messages: a list of parts, the text in "text" parts
+                return "\n".join(
+                    str(part.get("text") or "") for part in content or [] if isinstance(part, dict)
+                )
+
             delivered = any(
-                block in (message.get("content") if isinstance(message.get("content"), str) else json.dumps(message.get("content")))
-                for message in self._history_messages
-                if message.get("role") == "user"
+                block in _text(message) for message in self._history_messages if message.get("role") == "user"
             )
             # On the level-up message after a fresh review, and once more when a
             # trim has removed the message that carried it (the prefix changed

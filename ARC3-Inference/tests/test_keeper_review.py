@@ -195,3 +195,20 @@ def test_game_over_reviews_only_with_their_switch(tmp_path, monkeypatch):
     monkeypatch.setenv("KEEPER_REVIEW", "1")
     agent, state_path, game = make_agent(tmp_path)
     assert agent._keeper.review_on_game_over is False
+
+
+def test_notes_block_is_not_repeated_when_messages_carry_images(tmp_path, monkeypatch):
+    from inference.agent.tool_agent import ToolAgent
+
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    calls = []
+    monkeypatch.setattr(ToolAgent, "_chat_completion", _fake_completion(_reply("cause", []), calls))
+    agent, state_path, game = make_agent(tmp_path)
+    game.complete_at_col = 8
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    opener = agent._keeper_before_turn(state_path, "LEVEL UP", lambda *a: None, 900.0)
+    assert opener.startswith("KEEPER NOTES")
+    agent._history_messages.append(
+        {"role": "user", "content": [{"type": "text", "text": opener}, {"type": "image_url", "image_url": {"url": "data:"}}]}
+    )
+    assert agent._keeper_before_turn(state_path, "NEXT", lambda *a: None, 900.0) == "NEXT"
