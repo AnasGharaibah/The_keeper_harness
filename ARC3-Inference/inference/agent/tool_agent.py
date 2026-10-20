@@ -31,6 +31,7 @@ from inference.utils.animation import (
 from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
+    KEEPER_REVIEW_ADDENDUM,
     KEEPER_SURPRISE_ADDENDUM,
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
@@ -68,7 +69,8 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent import keeper_auto
+from inference.agent import keeper_auto, keeper_review
+from inference.agent.keeper_check_sandbox import run_check as keeper_run_check
 from inference.agent.keeper_config import KeeperConfig
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
@@ -2721,6 +2723,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     _keeper = KeeperConfig.from_env()
     if _keeper.surprise:
         prompt += KEEPER_SURPRISE_ADDENDUM
+    if _keeper.review:
+        prompt += KEEPER_REVIEW_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
         prompt += STEP_VERIFICATION_ADDENDUM
@@ -5397,6 +5401,137 @@ class ToolAgent:
             return [self._summarize_planned_actions(item) for item in value]
         return value
 
+    def _keeper_memory_for(self, state_path: Path) -> keeper_review.KeeperMemory:
+        keeper = self._keeper
+        memory = getattr(self, "_keeper_memory", None)
+        previous_dir = getattr(self, "_keeper_memory_dir", None)
+        if memory is None or previous_dir != state_path.parent:
+            if previous_dir is not None:
+                # a different game session: nothing carries over
+                self._keeper_pending_review = None
+                self._keeper_block = ""
+            memory = keeper_review.KeeperMemory(
+                min_support=keeper.facts_min_support,
+                max_open=keeper.review_max_open,
+                max_hypotheses=keeper.review_max_hypotheses,
+                path=state_path.with_name(f"{state_path.stem}_keeper_facts.json"),
+            )
+            self._keeper_memory = memory
+            self._keeper_memory_dir = state_path.parent
+        return memory
+
+    def _keeper_review_skip_reason(self, request_timeout_seconds: float | None) -> str:
+        """Why the review must not run now, or "" when it may."""
+        keeper = self._keeper
+        budget = float(keeper.review_time_budget_seconds)
+        gate = _priority_gate()
+        start = getattr(gate, "_clock_start", None) if gate is not None else None
+        deadline = getattr(gate, "_clock_deadline", None) if gate is not None else None
+        if start is not None and deadline is not None:
+            total = max(0.0, deadline - start)
+            remaining = deadline - time.monotonic()
+            if total > 0 and remaining <= keeper.review_tail_fraction * total:
+                return f"final {keeper.review_tail_fraction:.0%} of the scheduled runtime ({remaining / 60:.1f} min left)"
+            if remaining < budget:
+                return f"{remaining:.0f}s left, below the {budget:.0f}s review budget"
+        if request_timeout_seconds is not None and request_timeout_seconds < budget:
+            return f"request time cap {request_timeout_seconds:.0f}s is below the {budget:.0f}s review budget"
+        return ""
+
+    def _keeper_before_turn(
+        self, state_path: Path, user_prompt: str, append_transcript, request_timeout_seconds: float | None
+    ) -> str:
+        """Keeper: run a pending post-level review, then return the user prompt with
+        the notes block in front of it (on the level-up message, or once more
+        after the message carrying it was trimmed away). Never raises."""
+        keeper = self._keeper
+        try:
+            memory = self._keeper_memory_for(state_path)
+            pending = getattr(self, "_keeper_pending_review", None)
+            fresh = False
+            if pending is not None:
+                self._keeper_pending_review = None
+                skip = self._keeper_review_skip_reason(request_timeout_seconds)
+                if skip:
+                    log.warning("keeper review of level %s skipped: %s", pending["level"], skip)
+                    append_transcript("KEEPER REVIEW", f"skipped for level {pending['level']}: {skip}")
+                    memory.reviews.append({"level": pending["level"], "skipped": skip})
+                    memory.save()
+                else:
+                    self._keeper_review(state_path, memory, int(pending["level"]), append_transcript, request_timeout_seconds)
+                    fresh = True
+            block = memory.notes_block()
+            if not block:
+                return user_prompt
+            delivered = any(
+                block in (message.get("content") if isinstance(message.get("content"), str) else json.dumps(message.get("content")))
+                for message in self._history_messages
+                if message.get("role") == "user"
+            )
+            # On the level-up message after a fresh review, and once more when a
+            # trim has removed the message that carried it (the prefix changed
+            # there anyway, so re-adding it costs no extra prefill).
+            if fresh or not delivered:
+                self._keeper_block = block
+                return f"{block}\n\n{user_prompt}"
+            return user_prompt
+        except Exception as exc:  # noqa: BLE001 - the review must never break a turn
+            log.warning("keeper review failed: %s", exc)
+            return user_prompt
+
+    def _keeper_review(
+        self, state_path: Path, memory: keeper_review.KeeperMemory, level: int, append_transcript,
+        request_timeout_seconds: float | None,
+    ) -> None:
+        keeper = self._keeper
+        started = time.monotonic()
+        deadline = started + keeper.review_time_budget_seconds
+        _frame, history = load_runtime_state(state_path)
+        transitions = keeper_auto.level_transitions(history, level)
+        for item in transitions:
+            item["level"] = level
+            item["result"]["board_changed"] = item["before"] != item["after"]
+        if not transitions:
+            return
+        request = memory.request_text(
+            level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS
+        )
+        # Same system prompt, history and tools as the game's next request, so
+        # the review continues the cached prefix instead of prefilling a new one.
+        # The exchange is not stored in the game history.
+        messages = [{"role": "system", "content": self._system_prompt}, *self._history_messages,
+                    {"role": "user", "content": request}]
+        timeout = float(keeper.review_time_budget_seconds)
+        if request_timeout_seconds is not None:
+            timeout = min(timeout, float(request_timeout_seconds))
+        result = self._chat_completion(
+            messages,
+            tools=self._tools(state_path),
+            max_tokens=keeper.review_max_tokens,
+            enable_thinking=False,
+            request_timeout_seconds=timeout,
+        )
+        usage = getattr(result, "usage", None)
+        generated_before = self._session_generated_tokens
+        # Real GPU time: counted in the session total, but not toward this turn's
+        # yield budget, and not toward the level's tokens in the priority formula.
+        self._accumulate_usage_tokens(usage, count_toward_turn=False)
+        self._tokens_at_level_start = getattr(self, "_tokens_at_level_start", 0) + (
+            self._session_generated_tokens - generated_before
+        )
+        message = result.message or {}
+        reply = str(message.get("content") or "")
+        if not reply.strip():
+            reply = str(message.get("reasoning_content") or message.get("reasoning") or "")
+
+        def check(code: str, items: list[dict[str, Any]], perturb: bool) -> dict[str, Any]:
+            return keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
+
+        summary = memory.apply(level, reply, transitions, check, deadline=deadline)
+        summary["seconds"] = round(time.monotonic() - started, 1)
+        summary["generated_tokens"] = self._session_generated_tokens - generated_before
+        append_transcript("KEEPER REVIEW", json.dumps(summary, default=str))
+
     def _keeper_observe(self, state_path: Path, start_frame: Frame | None, payload: dict[str, Any]) -> None:
         """Keeper: add SURPRISE lines for the actions this tool call executed.
         Only called when a Keeper observation switch is on. Never raises."""
@@ -5985,6 +6120,20 @@ class ToolAgent:
         keeper = getattr(self, "_keeper", None)
         if step_executed and keeper is not None and keeper.any_observation:
             self._keeper_observe(state_path, current_frame, payload)
+        if step_executed and keeper is not None and keeper.review:
+            ended = next(
+                (
+                    reason
+                    for reason in ("level_completed", "game_over")
+                    if any(bool(item.get(reason)) for item in action_results)
+                ),
+                None,
+            )
+            if ended == "level_completed" or (ended == "game_over" and keeper.review_on_game_over):
+                self._keeper_pending_review = {
+                    "level": current_frame.level if current_frame is not None else 1,
+                    "reason": ended,
+                }
         made_progress = any(
             bool(item.get("gameplay_changed"))
             or bool(item.get("level_completed"))
@@ -6717,6 +6866,11 @@ class ToolAgent:
             # the turn cache for this one message
             self._pending_diff_image = self._turn_diff_image
             self._pending_diff_image_label = self._turn_diff_image_label
+        keeper = getattr(self, "_keeper", None)
+        if keeper is not None and keeper.review and not resuming_after_yield:
+            user_prompt = self._keeper_before_turn(
+                state_path, user_prompt, append_transcript, request_timeout_seconds
+            )
         if resume_mode == "state_only":
             opening_message = self._build_user_message(
                 _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION,

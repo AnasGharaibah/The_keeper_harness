@@ -233,6 +233,11 @@ KEEPER_SURPRISE_ADDENDUM = (
     "from the last time it was used on this level (same action, same cell for MOUSE).\n"
 )
 
+KEEPER_REVIEW_ADDENDUM = (
+    "- After you complete a level, the next message may start with KEEPER NOTES: facts the harness "
+    "verified against your recorded moves, and unverified ideas from a short review of that level.\n"
+)
+
 FRAME_DIFF_HINT_ADDENDUM = (
     "- `frame_diff(before=None, after=None)` compares two frames. Omitted arguments default to `previous_frame` and `current_frame`, respectively.\n"
     "- It returns a dictionary containing `changed_cell_count` (an integer) and lists named `moved`, `rotated`, `appeared`, `disappeared`, `changed_color`, and `resized`. Unchanged objects are omitted.\n"
