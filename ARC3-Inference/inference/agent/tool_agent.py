@@ -14,20 +14,35 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
-from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig
+from inference.agent.auto_prediction import (
+    VERDICT_RESET,
+    VERDICT_SURPRISE,
+    action_key,
+    auto_predict,
+    batch_summary,
+    grid_transitions_for_level,
+    hud_mask,
+    summarize_auto,
+)
+from inference.agent.perception import PerceptionTracker
+from inference.agent.layer_config import LevelReviewConfig, PredictionCheckConfig, WorldModelConfig
 from inference.agent.level_memory import LevelMemory
 from inference.agent.prediction import (
     VERDICT_WRONG,
     prediction_counts,
     summarize_predictions,
-    unchecked_prediction,
+    no_prediction_result,
 )
 from inference.agent.prompts import (
+    AUTO_PREDICTION_ADDENDUM,
+    BATCH_ADDENDUM,
+    PERCEPTION_ADDENDUM,
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
     LEVEL_REVIEW_ADDENDUM,
     PREDICTION_CHECK_ADDENDUM,
     PYTHON_ADDENDUM,
+    WORLD_MODEL_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
@@ -177,6 +192,10 @@ _PYTHON_TOOL_PREDICTION_DESCRIPTION = (
     " Pass `expect={...}` to `action(...)` to have the harness check your predicted effect "
     "(`last_prediction`, `prediction_log`)."
 )
+_PYTHON_TOOL_WORLD_MODEL_DESCRIPTION = (
+    " Call `world_model(text)` / `plan(text)` to store your current understanding and plan; "
+    "the harness shows them back to you every turn."
+)
 _PYTHON_TOOL_REVIEW_DESCRIPTION = (
     " Call `hypothesis(text, kind='rule'|'goal', check_code=None)` to record a claim the harness "
     "verifies after the level."
@@ -314,6 +333,55 @@ def _extract_scientist_note(content: str) -> dict[str, str]:
     return result
 
 
+_REASONING_NOTE_LABELS = {
+    "world model": "world_model",
+    "goal model": "goal_model",
+    "action model": "action_model",
+    "open questions": "open_questions",
+    "plan": "current_plan",
+}
+_REASONING_NOTE_MAX_CHARS = 600
+
+
+def _extract_last_notes_from_reasoning(reasoning: str) -> dict[str, str]:
+    """Last ``World model:`` / ``Goal model:`` / ``Action model:`` / ``Open questions:``
+    / ``Plan:`` block in free reasoning text. A block runs from its label to the next
+    blank line or label, capped, so a label early in a long monologue does not
+    swallow everything after it."""
+    found: dict[str, str] = {}
+    lines = str(reasoning or "").splitlines()
+    index = 0
+    while index < len(lines):
+        candidate = lines[index].strip().lstrip("-*").strip().lstrip("#").strip().replace("**", "")
+        lowered = candidate.lower()
+        key = next(
+            (key for label, key in _REASONING_NOTE_LABELS.items() if lowered.startswith(f"{label}:")),
+            None,
+        )
+        if key is None:
+            index += 1
+            continue
+        parts = [candidate.split(":", 1)[1].strip()]
+        index += 1
+        while index < len(lines):
+            follow = lines[index].strip()
+            follow_label = follow.lstrip("-*").strip().lstrip("#").strip().replace("**", "").lower()
+            if not follow or any(follow_label.startswith(f"{label}:") for label in _REASONING_NOTE_LABELS):
+                break
+            parts.append(follow)
+            index += 1
+        text = " ".join(part for part in parts if part).strip()
+        if text:
+            found[key] = text[:_REASONING_NOTE_MAX_CHARS]
+    return found
+
+
+def _is_repeated_batch(actions: list[dict[str, Any]]) -> bool:
+    """One repeated action means the same action on the same cell; clicks on
+    different cells are a mixed batch."""
+    return len({(action_key(str(item.get("action") or "")), item.get("row"), item.get("col")) for item in actions}) == 1
+
+
 def _empty_world_model() -> dict[str, str]:
     return {
         "world_model": "",
@@ -370,6 +438,10 @@ def _build_system_prompt(
     tool_output_tokens: int,
     prediction_check: bool = False,
     level_review: bool = False,
+    auto_predict: bool = False,
+    world_model: bool = False,
+    perception: bool = False,
+    batch: bool = False,
 ) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -380,8 +452,16 @@ def _build_system_prompt(
     prompt += PYTHON_ADDENDUM
     if prediction_check:
         prompt += PREDICTION_CHECK_ADDENDUM
+        if auto_predict:
+            prompt += AUTO_PREDICTION_ADDENDUM
+            if perception:
+                prompt += PERCEPTION_ADDENDUM
+            if batch:
+                prompt += BATCH_ADDENDUM
     if level_review:
         prompt += LEVEL_REVIEW_ADDENDUM
+    if world_model:
+        prompt += WORLD_MODEL_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
     return prompt
 
@@ -950,6 +1030,7 @@ class ToolAgent:
         provider: str | None = None,
         prediction_check: PredictionCheckConfig | None = None,
         level_review: LevelReviewConfig | None = None,
+        world_model: WorldModelConfig | None = None,
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
@@ -977,21 +1058,34 @@ class ToolAgent:
         self._save_request_logs = bool(save_request_logs)
         self._prediction_config = prediction_check or PredictionCheckConfig.from_env()
         self._review_config = level_review or LevelReviewConfig.from_env()
+        self._world_model_config = world_model or WorldModelConfig.from_env()
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
             prediction_check=self._prediction_config.enabled,
             level_review=self._review_config.enabled,
+            auto_predict=self._prediction_config.auto_predict,
+            world_model=self._world_model_config.enabled,
+            perception=self._prediction_config.perception,
+            batch=self._prediction_config.batch_summary or self._prediction_config.batch_stop,
         )
         self._tool_description = (
             _PYTHON_TOOL_DESCRIPTION
             + (_PYTHON_TOOL_PREDICTION_DESCRIPTION if self._prediction_config.enabled else "")
             + (_PYTHON_TOOL_REVIEW_DESCRIPTION if self._review_config.enabled else "")
+            + (_PYTHON_TOOL_WORLD_MODEL_DESCRIPTION if self._world_model_config.enabled else "")
         )
         self._level_memory: LevelMemory | None = None
         # One entry per executed action(...) call (all levels), plus viewer events
         # buffered for the solver to drain after each turn.
         self._prediction_entries: list[dict[str, Any]] = []
         self._layer_events: list[dict[str, Any]] = []
+        # Harness auto-predictions (source="auto"), kept apart from the model's expect= verdicts.
+        self._auto_entries: list[dict[str, Any]] = []
+        self._step_flags: dict[int, dict[str, Any]] = {}
+        self._moves_without_expect = 0
+        self._world_model_called_this_turn = False
+        self._turns_without_world_model = 0
+        self._perception = self._new_perception_tracker()
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -1035,11 +1129,61 @@ class ToolAgent:
             self._summarized_knowledge = _empty_world_model()
             self._prediction_entries = []
             self._layer_events = []
+            self._auto_entries = []
+            self._step_flags = {}
+            self._moves_without_expect = 0
+            self._world_model_called_this_turn = False
+            self._turns_without_world_model = 0
+            self._perception = self._new_perception_tracker()
             self._level_memory = (
                 LevelMemory(self._review_config, facts_path=_facts_path(state_path))
                 if self._review_config.enabled
                 else None
             )
+
+    def _batch_continue_check(
+        self, state_path: Path, level: int | None, actions: list[dict[str, Any]]
+    ) -> Callable[[dict[str, Any], int, int], str | None]:
+        """Per-action early-stop hook for one multi-action call (see HarnessSolver.step_env)."""
+        config = self._prediction_config
+        repeated = _is_repeated_batch(actions)
+        state = {"blocked": 0}
+
+        def check(payload: dict[str, Any], index: int, size: int) -> str | None:
+            _frame, history = load_runtime_state(state_path)
+            transitions = grid_transitions_for_level(history, level)
+            if not transitions:
+                return None
+            for transition in transitions:
+                transition["result"] = dict(self._step_flags.get(int(transition["step"]), {}))
+            transitions[-1]["result"].update(
+                {key: payload.get(key) for key in ("level_completed", "game_over") if key in payload}
+            )
+            (verdict,) = auto_predict(
+                transitions,
+                change_fraction=config.hud_change_fraction,
+                new_count=1,
+                reset_detection=config.reset_detection,
+            )
+            if verdict["verdict"] == VERDICT_RESET:
+                return "RESET detected (board back to level start)" if config.stop_on_reset else None
+            state["blocked"] = state["blocked"] + 1 if verdict.get("blocked") else 0
+            if config.stop_after_blocked and state["blocked"] >= config.stop_after_blocked:
+                return f"blocked {state['blocked']} times in a row"
+            if verdict["verdict"] == VERDICT_SURPRISE and (
+                (repeated and config.stop_on_surprise_repeated) or (not repeated and config.stop_on_surprise_mixed)
+            ):
+                first = verdict["lines"][0] if verdict.get("lines") else "SURPRISE"
+                return first[len("SURPRISE: "):] if first.startswith("SURPRISE: ") else first
+            return None
+
+        return check
+
+    def _new_perception_tracker(self) -> PerceptionTracker | None:
+        config = self._prediction_config
+        if not (config.enabled and config.auto_predict and config.perception):
+            return None
+        return PerceptionTracker(min_size=config.perception_min_size, max_lines=config.perception_max_lines)
 
     def drain_layer_events(self) -> list[dict[str, Any]]:
         """Return and clear viewer events buffered by the optional layers."""
@@ -1051,8 +1195,9 @@ class ToolAgent:
         ``messages[0]``, which context trimming never evicts, so the block is pinned."""
         if self._level_memory is None:
             return self._system_prompt
-        block = self._level_memory.render_pinned_block()
-        return f"{self._system_prompt}\n\n{block}" if block else self._system_prompt
+        blocks = [self._level_memory.render_pinned_block(), self._level_memory.render_learned_block()]
+        blocks = [block for block in blocks if block]
+        return "\n\n".join([self._system_prompt, *blocks])
 
     def _initial_messages(self, user_message: dict[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -1111,6 +1256,13 @@ class ToolAgent:
                 check_runner=self._run_review_check,
                 llm_call=llm_call,
                 time_budget_seconds=budget,
+                auto_entries=self._auto_entries,
+                hud_change_fraction=self._prediction_config.hud_change_fraction,
+                perception_max_lines=(
+                    self._prediction_config.perception_max_lines if self._perception is not None else 0
+                ),
+                perception_min_size=self._prediction_config.perception_min_size,
+                reset_detection=self._prediction_config.enabled and self._prediction_config.reset_detection,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must never stop play
             log.warning("level review failed: %s", exc)
@@ -1153,6 +1305,8 @@ class ToolAgent:
             state["next_hypothesis_index"] = self._level_memory.next_index
             state["quick_check_seconds"] = self._review_config.quick_check_seconds
             state["transition_results"] = self._level_memory.transition_results_payload()
+        if self._world_model_config.enabled:
+            state["world_model_enabled"] = True
         return state
 
     @property
@@ -1281,6 +1435,41 @@ class ToolAgent:
         for key, value in note.items():
             if value:
                 self._summarized_knowledge[key] = value
+
+    def _world_model_from_reasoning(self, reasoning: str) -> None:
+        """Fallback when the model reasons about its world model but never calls
+        world_model(): keep the last labelled block from the reasoning."""
+        config = self._world_model_config
+        if not config.enabled or not config.reasoning_fallback or self._world_model_called_this_turn:
+            return
+        notes = _extract_last_notes_from_reasoning(reasoning)
+        for key, value in notes.items():
+            self._summarized_knowledge[key] = value
+        if notes:
+            self._layer_events.append({"type": "world_model", "stored": sorted(notes), "source": "reasoning"})
+
+    def _begin_world_model_turn(self) -> str:
+        """Close the bookkeeping for the previous turn and return a nudge line when
+        world_model() has not been called for ``nudge_after_turns`` turns."""
+        config = self._world_model_config
+        if not config.enabled:
+            return ""
+        if self._last_step_summary is None and not self._history_messages:
+            return ""
+        if self._world_model_called_this_turn:
+            self._turns_without_world_model = 0
+        else:
+            self._turns_without_world_model += 1
+        self._world_model_called_this_turn = False
+        if config.nudge_after_turns <= 0 or self._turns_without_world_model < config.nudge_after_turns:
+            return ""
+        turns = self._turns_without_world_model
+        self._turns_without_world_model = 0
+        self._layer_events.append({"type": "world_model_nudge", "turns": turns})
+        return (
+            f"WORLD MODEL NOT UPDATED FOR {turns} TURNS \u2014 call world_model(text) with what you now believe "
+            "(entities, what each action does, how things are connected, the goal, open questions)."
+        )
 
     def _update_summarized_knowledge_from_step_summary(self) -> None:
         summary = self._last_step_summary
@@ -1679,7 +1868,7 @@ class ToolAgent:
         ) -> None:
             prediction = raw_payload.get("prediction")
             if not isinstance(prediction, dict):
-                prediction = unchecked_prediction()
+                prediction = no_prediction_result()
             entry: dict[str, Any] = {
                 "action_num": compact_payload.get("action_num"),
                 "actions": list(compact_payload.get("executed_actions") or []),
@@ -1695,6 +1884,86 @@ class ToolAgent:
                 for key in ("verdict", "failures", "skipped", "note")
                 if prediction.get(key)
             }
+
+        call_auto: list[dict[str, Any]] = []
+        call_warnings: list[str] = []
+        call_batch_summaries: list[str] = []
+        call_batch_stops: list[str] = []
+        reset_steps: set[int] = set()
+
+        def _record_auto_and_nudge(
+            compact_payload: dict[str, Any],
+            raw_payload: dict[str, Any],
+            expect: Any,
+            level: int | None,
+            requested_count: int = 1,
+        ) -> None:
+            per_action = [item for item in raw_payload.get("per_action") or [] if isinstance(item, dict)]
+            executed_steps: set[int] = set()
+            for item in per_action:
+                try:
+                    step = int(item.get("action_num"))
+                except (TypeError, ValueError):
+                    continue
+                executed_steps.add(step)
+                self._step_flags[step] = {
+                    key: item.get(key) for key in ("board_changed", "level_completed", "game_over", "reward")
+                }
+            config = self._prediction_config
+            if config.auto_predict:
+                try:
+                    _frame, refreshed_history = load_runtime_state(state_path)
+                    transitions = grid_transitions_for_level(refreshed_history, level)
+                    for transition in transitions:
+                        transition["result"] = self._step_flags.get(int(transition["step"]), {})
+                    new_count = sum(1 for transition in transitions if transition["step"] in executed_steps)
+                    verdicts = auto_predict(
+                        transitions,
+                        change_fraction=config.hud_change_fraction,
+                        new_count=new_count,
+                        reset_detection=config.reset_detection,
+                    )
+                    for position, verdict in enumerate(verdicts, start=1):
+                        verdict["batch"] = (position, max(requested_count, len(verdicts)))
+                        if verdict["verdict"] == VERDICT_RESET and verdict.get("step") is not None:
+                            reset_steps.add(int(verdict["step"]))
+                            self._step_flags.setdefault(int(verdict["step"]), {})["reset"] = True
+                    if self._perception is not None and verdicts:
+                        mask = hud_mask(transitions, change_fraction=config.hud_change_fraction)
+                        for verdict, transition in zip(verdicts, transitions[len(transitions) - len(verdicts) :]):
+                            verdict["perception"] = self._perception.observe(
+                                transition, mask, level=level, reset=verdict["verdict"] == VERDICT_RESET
+                            )
+                except Exception as exc:  # noqa: BLE001 - auto-prediction must never break an action
+                    log.warning("auto prediction failed: %s", exc)
+                    verdicts = []
+                for verdict in verdicts:
+                    verdict["level"] = level
+                self._auto_entries.extend(verdicts)
+                call_auto.extend(verdicts)
+                if verdicts:
+                    compact_payload["auto_prediction"] = summarize_auto(
+                        verdicts,
+                        max_surprises_shown=config.max_surprises_shown,
+                        max_perception_shown=2 * config.perception_max_lines,
+                    )
+                if config.batch_summary and len(verdicts) > 1:
+                    summary_line = batch_summary(verdicts, max_chars=config.batch_summary_max_chars)
+                    compact_payload["batch_summary"] = summary_line
+                    call_batch_summaries.append(summary_line)
+            if config.nudge_after_actions > 0:
+                if expect is not None:
+                    self._moves_without_expect = 0
+                else:
+                    self._moves_without_expect += max(1, len(per_action))
+                    if self._moves_without_expect >= config.nudge_after_actions:
+                        warning = (
+                            f"NO PREDICTION FOR LAST {self._moves_without_expect} MOVES "
+                            "\u2014 use expect= when testing an idea"
+                        )
+                        self._moves_without_expect = 0
+                        compact_payload["prediction_warning"] = warning
+                        call_warnings.append(warning)
 
         def _handle_action(actions: list[dict[str, Any]], expect: Any = None) -> dict[str, Any]:
             nonlocal terminal_action_result, current_level
@@ -1733,6 +2002,15 @@ class ToolAgent:
             step_arguments: dict[str, Any] = {"actions": normalized_actions}
             if self._prediction_config.enabled and expect is not None:
                 step_arguments["expect"] = expect
+            if (
+                self._prediction_config.enabled
+                and self._prediction_config.auto_predict
+                and self._prediction_config.batch_stop
+                and len(normalized_actions) > 1
+            ):
+                step_arguments["continue_check"] = self._batch_continue_check(
+                    state_path, current_level, normalized_actions
+                )
             raw_payload = self._step_env_callback(step_arguments)
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
@@ -1746,8 +2024,27 @@ class ToolAgent:
                         step_arguments.get("expect"),
                         level_before,
                     )
+                    _record_auto_and_nudge(
+                        compact_payload,
+                        raw_payload,
+                        step_arguments.get("expect"),
+                        level_before,
+                        requested_count=len(normalized_actions),
+                    )
+                if compact_payload.get("stop_reason") == "early_stop":
+                    executed_count = int(compact_payload.get("executed_count") or 1)
+                    requested = int(compact_payload.get("requested_count") or len(normalized_actions))
+                    message = (
+                        f"BATCH STOPPED at step {compact_payload.get('action_num')} ({executed_count}/{requested}): "
+                        f"{compact_payload.get('stop_detail')} \u2014 {requested - executed_count} actions not executed"
+                    )
+                    compact_payload["batch_stopped"] = message
+                    call_batch_stops.append(message)
+                    self._layer_events.append({"type": "batch_stopped", "message": message})
                 if self._level_memory is not None:
                     self._level_memory.record_transition_results(raw_payload.get("per_action"))
+                    for step in sorted(reset_steps):
+                        self._level_memory.mark_reset(step)
                     end_reason = _terminal_action_reason(compact_payload)
                     if end_reason in {"level_completed", "game_over", "run_complete"}:
                         self._level_memory.mark_review_pending(level_before, end_reason)
@@ -1819,6 +2116,50 @@ class ToolAgent:
                     ][: self._prediction_config.max_wrong_diffs_shown],
                 }
             )
+        notes = sandbox_result.get("notes") or {}
+        if self._world_model_config.enabled and notes:
+            stored = []
+            if notes.get("world_model"):
+                self._summarized_knowledge["world_model"] = str(notes["world_model"])
+                stored.append("world_model")
+            if notes.get("plan"):
+                self._summarized_knowledge["current_plan"] = str(notes["plan"])
+                stored.append("plan")
+            if stored:
+                self._world_model_called_this_turn = True
+                payload["memory_stored"] = f"{' and '.join(stored)} stored; shown back to you every turn"
+                self._layer_events.append({"type": "world_model", "stored": stored})
+        if call_auto:
+            payload["auto_prediction"] = summarize_auto(
+                call_auto,
+                max_surprises_shown=self._prediction_config.max_surprises_shown,
+                max_perception_shown=2 * self._prediction_config.perception_max_lines,
+            )
+            self._layer_events.append(
+                {
+                    "type": "auto_prediction",
+                    "counts": {
+                        verdict: sum(1 for entry in call_auto if entry["verdict"] == verdict)
+                        for verdict in ("as_before", "surprise", "first_time")
+                    },
+                    "surprises": [
+                        line
+                        for entry in call_auto
+                        if entry["verdict"] == VERDICT_SURPRISE
+                        for line in entry["lines"]
+                    ][: self._prediction_config.max_surprises_shown],
+                    "perception": [line for entry in call_auto for line in entry.get("perception") or []][
+                        : 2 * self._prediction_config.perception_max_lines
+                    ],
+                }
+            )
+        if call_batch_summaries:
+            payload["batch_summary"] = call_batch_summaries if len(call_batch_summaries) > 1 else call_batch_summaries[0]
+        if call_batch_stops:
+            payload["batch_stopped"] = call_batch_stops if len(call_batch_stops) > 1 else call_batch_stops[0]
+        if call_warnings:
+            payload["prediction_warning"] = call_warnings[-1]
+            self._layer_events.append({"type": "prediction_nudge", "warning": call_warnings[-1]})
         if self._level_memory is not None and sandbox_result.get("hypotheses"):
             recorded = self._level_memory.add_hypotheses(
                 sandbox_result.get("hypotheses"),
@@ -1985,6 +2326,9 @@ class ToolAgent:
             history_entries=history_entries,
             previous_step_summary=self._last_step_summary,
         )
+        world_model_nudge = self._begin_world_model_turn()
+        if world_model_nudge:
+            user_prompt = "\n".join([world_model_nudge, "", user_prompt])
         if review_notices:
             user_prompt = "\n".join([*review_notices, "", user_prompt])
         display_action_num = _display_action_number(action_num)
@@ -2147,6 +2491,7 @@ class ToolAgent:
                 if reasoning:
                     captured_reasoning = reasoning
                     append_transcript("THINKING", reasoning)
+                    self._world_model_from_reasoning(reasoning)
                     assistant_message["reasoning"] = reasoning
 
                 if not tool_calls:

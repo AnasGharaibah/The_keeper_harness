@@ -335,3 +335,43 @@ def test_check_cannot_call_action():
     )
     assert report["status"] == "error"
     assert "NameError" in report["error"]
+
+
+# ----- world_model() / plan() --------------------------------------------------
+
+
+def _no_action(_actions: list[dict[str, Any]], **_kwargs: Any) -> dict[str, Any]:
+    raise AssertionError("no action expected")
+
+
+def test_world_model_and_plan_return_notes_when_enabled():
+    outcome = run_sandboxed_python(
+        code="r = world_model('blue cell is the player')\nplan('go right')\nresult = r",
+        timeout_seconds=10,
+        initial_state=_state(world_model_enabled=True),
+        action_handler=_no_action,
+    )
+    assert outcome["error"] == ""
+    assert outcome["notes"] == {"world_model": "blue cell is the player", "plan": "go right"}
+    assert outcome["result"]["stored"] == "world_model"
+
+
+def test_world_model_absent_when_disabled():
+    outcome = run_sandboxed_python(
+        code="world_model('x')",
+        timeout_seconds=10,
+        initial_state=_state(),
+        action_handler=_no_action,
+    )
+    assert "world_model" in outcome["error"] and outcome["notes"] == {}
+
+
+def test_notes_survive_a_later_error():
+    outcome = run_sandboxed_python(
+        code="world_model('kept')\nraise ValueError('boom')",
+        timeout_seconds=10,
+        initial_state=_state(world_model_enabled=True),
+        action_handler=_no_action,
+    )
+    assert "boom" in outcome["error"]
+    assert outcome["notes"] == {"world_model": "kept"}

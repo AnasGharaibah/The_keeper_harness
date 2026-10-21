@@ -7,7 +7,9 @@ from dataclasses import dataclass
 
 from inference.utils.openai_compat import normalize_provider
 
-DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
+# Python 3.13 rebuild of driessmit1/arc3-vllm-h100-wheelhouse-v3 (same 174 pins);
+# Kaggle's image moved to Python 3.13 and the original holds cp312 wheels only.
+DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "anasgharaibah/keeper-vllm-wheelhouse-py313"
 DEFAULT_QWEN_MODEL_DATASET_SOURCE = "driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot"
 DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
@@ -58,6 +60,13 @@ class DuckKaggleVllmConfig:
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
     wheelhouse_stamp_text: str = DEFAULT_WHEELHOUSE_STAMP_TEXT
 
+
+
+_LAYER_ENV_PREFIXES = (
+    "LOCAL_ANALYZER_PREDICTION_CHECK_",
+    "LOCAL_ANALYZER_LEVEL_REVIEW_",
+    "LOCAL_ANALYZER_WORLD_MODEL_",
+)
 
 def duck_kaggle_dataset_sources(
     config: DuckKaggleVllmConfig | None = None,
@@ -118,6 +127,16 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_ENABLE_THINKING__": repr(os.environ.get("LOCAL_ANALYZER_ENABLE_THINKING", "1")),
         "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
+        # Keeper layers (prediction check / auto-prediction / perception, level
+        # review, world model): pass every layer switch the launcher exported so
+        # the Kaggle run uses the same layer config as the launching JSON.
+        "__LAYER_ENV__": repr(
+            {
+                key: value
+                for key, value in sorted(os.environ.items())
+                if key.startswith(_LAYER_ENV_PREFIXES) and value != ""
+            }
+        ),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
     }
@@ -285,7 +304,7 @@ def tail_server_log(lines: int = 80) -> str:
     return '\n'.join(VLLM_SERVER_LOG.read_text(encoding='utf-8', errors='replace').splitlines()[-lines:])
 
 
-def wait_for_vllm_server(timeout_seconds: int = 900) -> None:
+def wait_for_vllm_server(timeout_seconds: int = 2700) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f'{VLLM_BASE_URL}/models'
     while time.monotonic() < deadline:
@@ -303,8 +322,46 @@ def wait_for_vllm_server(timeout_seconds: int = 900) -> None:
     raise TimeoutError(f'Timed out waiting for vLLM server at {url}.\nLast server log lines:\n{tail_server_log()}')
 
 
+def log_memory() -> None:
+    try:
+        info = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines() if ':' in line)
+        total = int(info['MemTotal'].split()[0]) / 1024 / 1024
+        available = int(info['MemAvailable'].split()[0]) / 1024 / 1024
+        print(f'Host RAM: {total:.1f} GiB total, {available:.1f} GiB available', flush=True)
+    except (OSError, KeyError, ValueError) as exc:
+        print(f'Host RAM: unknown ({exc!r})', flush=True)
+
+
+def prefetch_model_weights(chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    # Read the weight files once, sequentially, so vLLM's memory-mapped load hits
+    # the page cache instead of random reads on the network-backed dataset mount
+    # (the page cache is evictable, so this cannot exhaust host RAM).
+    files = sorted(MODEL_PATH.glob('*.safetensors'))
+    total = sum(path.stat().st_size for path in files)
+    print(f'Prefetching {len(files)} weight file(s), {total / 1e9:.1f} GB', flush=True)
+    started = time.monotonic()
+    done = 0
+    next_report = started + 60
+    for path in files:
+        with path.open('rb', buffering=0) as handle:
+            while True:
+                block = handle.read(chunk_bytes)
+                if not block:
+                    break
+                done += len(block)
+                if time.monotonic() >= next_report:
+                    rate = done / max(1e-6, time.monotonic() - started) / 1e6
+                    print(f'  prefetched {done / 1e9:.1f}/{total / 1e9:.1f} GB ({rate:.0f} MB/s)', flush=True)
+                    next_report += 60
+    elapsed = time.monotonic() - started
+    print(f'Prefetch done in {elapsed:.0f}s ({done / max(1e-6, elapsed) / 1e6:.0f} MB/s)', flush=True)
+
+
 def start_vllm_server() -> None:
     install_vllm_wheelhouse()
+    log_memory()
+    prefetch_model_weights()
+    log_memory()
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_PID.unlink(missing_ok=True)
     log_handle = VLLM_SERVER_LOG.open('w', encoding='utf-8')
@@ -390,6 +447,7 @@ setup_env = {
     'LOCAL_ANALYZER_ENABLE_THINKING': __LOCAL_ANALYZER_ENABLE_THINKING__,
     'MULTIMODAL_CONTEXT': __MULTIMODAL_CONTEXT__,
     'MULTIMODAL_UPSCALE': __MULTIMODAL_UPSCALE__,
+    **__LAYER_ENV__,
 }
 setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])
 existing_setup_env = {}

@@ -355,3 +355,193 @@ def test_end_to_end_with_real_sandbox_checks():
     assert memory.get(real).support == 3
     assert memory.get(vacuous).status == "unverified"
     assert memory.get(wrong).status == "refuted"
+
+
+# ----- LEARNED LAST LEVEL block -------------------------------------------------
+
+
+def test_learned_block_shows_cause_and_untested_ideas_only():
+    memory = LevelMemory(LevelReviewConfig(enabled=True, max_untested_shown=2))
+    assert memory.render_learned_block() == ""
+    memory.add_hypotheses(
+        [
+            {"id": "H1", "text": "entering the top box wins", "kind": "goal", "level": 1},
+            {"id": "H2", "text": "UP moves the player", "kind": "rule", "level": 1},
+            {"id": "H3", "text": "something always true", "kind": "rule", "level": 1},
+            {"id": "H4", "text": "verified thing", "kind": "rule", "level": 1},
+        ],
+        default_level=1,
+    )
+    h1, h2, h3, h4 = (memory.get(f"H{i}") for i in range(1, 5))
+    h1.status, h1.support = "unverified", 1
+    h2.status, h2.support = "unverified", 0
+    h3.status, h3.support, h3.reason = "unverified", 9, "unfalsifiable: also passed on harness-perturbed transitions"
+    h4.status = "fact"
+    memory.last_review = {"level": 1, "reason": "level_completed"}
+    memory.level_causes[1] = "The player entered the top box after the indicator matched."
+    block = memory.render_learned_block()
+    assert block.startswith("LEARNED LAST LEVEL (L1, level_completed):")
+    assert "Likely cause (reviewer's reading, not verified): The player entered the top box" in block
+    assert "UNTESTED IDEAS (test these with expect=):" in block
+    assert "- H1 entering the top box wins [unverified, support 1]" in block
+    assert "H2 UP moves the player" in block
+    assert "H3" not in block and "H4" not in block
+
+
+def test_learned_block_switch_off():
+    memory = LevelMemory(LevelReviewConfig(enabled=True, learned_block=False))
+    memory.last_review = {"level": 1, "reason": "level_completed"}
+    assert memory.render_learned_block() == ""
+
+
+# ----- merged post-level review (cause + reviewer hypotheses) ------------------
+
+
+def _reply(cause: str, hypotheses: list[dict[str, str]], **extra: Any) -> str:
+    return json.dumps({"cause": cause, "hypotheses": hypotheses, **extra})
+
+
+def test_post_level_review_runs_without_agent_hypotheses_and_verifies_mechanically():
+    memory = _memory()
+    memory.mark_review_pending(1, "level_completed")
+    seen: list[list[dict[str, Any]]] = []
+
+    def llm(messages, _timeout):
+        seen.append(messages)
+        return _reply(
+            "The final RIGHT completed the level after two RIGHT moves.",
+            [
+                {"text": "RIGHT moves blue right", "kind": "rule", "check_code": "GOOD"},
+                {"text": "anything goes", "kind": "rule", "check_code": "TAUTOLOGY"},
+                {"text": "this one crashes", "kind": "rule", "check_code": "BROKEN"},
+                {"text": "no code at all", "kind": "rule", "check_code": ""},
+            ],
+        )
+
+    runner = FakeRunner(
+        {
+            "GOOD": PASS,
+            "TAUTOLOGY": dict(PASS, falsifiable=False),
+            "BROKEN": {"status": "error", "error": "NameError: x"},
+        }
+    )
+    (summary,) = _review(memory, HISTORY_L1, runner, llm_call=llm)
+    assert summary["llm"] == "ran"
+    assert summary["cause"].startswith("The final RIGHT completed the level")
+    assert memory.level_causes[1] == summary["cause"]
+    assert summary["reviewer_hypotheses"] == ["H1", "H2", "H3"]
+    good, tautology, broken = (memory.get(f"H{i}") for i in (1, 2, 3))
+    assert {h.source for h in (good, tautology, broken)} == {"reviewer"}
+    assert good.status == "fact"  # passed the same check + min_support + perturbation test
+    assert tautology.status == "unverified" and tautology.reason.startswith("unfalsifiable")
+    assert broken.status == "pending" and broken.check_code is None  # review-written code that fails to run is dropped
+    prompt = seen[0][1]["content"]
+    assert "the agent WON this level" in prompt and "Per-move effects" in prompt
+    assert "Agent's open hypotheses" not in prompt
+
+
+def test_reviewer_cannot_promote_without_passing_check():
+    memory = _memory(min_support=5)
+    memory.mark_review_pending(1, "level_completed")
+    llm = lambda _m, _t: _reply("cause", [{"text": "claimed fact", "kind": "goal", "check_code": "GOOD"}])  # noqa: E731
+    _review(memory, HISTORY_L1, FakeRunner({"GOOD": PASS}), llm_call=llm)
+    assert memory.get("H1").status == "unverified"  # support 3 < min_support 5
+
+
+def test_post_level_review_off_keeps_old_behaviour():
+    memory = _memory(post_level_review=False)
+    memory.mark_review_pending(1, "level_completed")
+    calls: list[Any] = []
+    (summary,) = _review(memory, HISTORY_L1, FakeRunner({}), llm_call=lambda m, t: calls.append(m) or "{}")
+    assert calls == [] and summary["llm"] == "not needed"
+    assert "reviewer_hypotheses" not in summary
+
+
+def test_post_level_review_respects_per_level_limit_and_budget():
+    memory = _memory(max_llm_calls_per_level=0)
+    memory.mark_review_pending(1, "level_completed")
+    (summary,) = _review(memory, HISTORY_L1, FakeRunner({}), llm_call=lambda m, t: "{}")
+    assert summary["llm"] == "skipped: per-level call limit"
+    memory = _memory()
+    memory.mark_review_pending(1, "level_completed")
+    (summary,) = _review(memory, HISTORY_L1, FakeRunner({}), llm_call=lambda m, t: "{}", budget=1.0)
+    assert summary["llm"] == "skipped: no time left"
+
+
+def test_reviewer_hypothesis_limit():
+    memory = _memory(max_reviewer_hypotheses=2)
+    memory.mark_review_pending(1, "level_completed")
+    hyps = [{"text": f"claim {i}", "kind": "rule", "check_code": "GOOD"} for i in range(5)]
+    (summary,) = _review(memory, HISTORY_L1, FakeRunner({"GOOD": PASS}), llm_call=lambda m, t: _reply("c", hyps))
+    assert summary["reviewer_hypotheses"] == ["H1", "H2"]
+
+
+def test_merged_move_lines_merge_repeats_cap_and_keep_final_move():
+    from inference.agent.level_memory import merged_move_lines
+
+    history = _history([(1, "RIGHT")] * 3 + [(1, "UP")] + [(1, "RIGHT"), (1, "UP")] * 2)
+    lines = merged_move_lines(history, 1, {}, hud_change_fraction=0.8, max_lines=60)
+    assert lines[0].startswith("steps 1-3 RIGHT x3:") and lines[0].endswith("each")
+    assert "moved [0,1]" in lines[0]
+    assert lines[1] == "step 4 UP: blocked"
+    capped = merged_move_lines(history, 1, {8: {"level_completed": True}}, hud_change_fraction=0.8, max_lines=3)
+    assert capped[0] == "... 3 earlier move groups omitted"
+    assert len(capped) == 4 and capped[-1] == "step 8 UP: level completed"
+
+
+# ----- carrying open hypotheses across levels ------------------------------------
+
+
+def test_unverified_hypothesis_is_rechecked_on_next_level_and_promoted():
+    memory = _memory(min_support=4)
+    hypothesis_id = _add(memory, "RIGHT moves blue right", "C1")
+    history = _history([(1, "RIGHT"), (1, "RIGHT"), (2, "RIGHT"), (2, "RIGHT")])
+    runner = FakeRunner({"C1": lambda transitions: dict(PASS, support=len(transitions))})
+    memory.mark_review_pending(1, "level_completed")
+    _review(memory, history, runner, llm_call=None)
+    hypothesis = memory.get(hypothesis_id)
+    assert hypothesis.status == "unverified"
+    first_support = hypothesis.support
+    memory.mark_review_pending(2, "level_completed")
+    _review(memory, history, runner, llm_call=None)
+    assert hypothesis.support > first_support
+    assert hypothesis.status == "fact" and hypothesis.levels_held == [1, 2]
+
+
+def test_carry_cap_keeps_highest_support_then_most_recent():
+    memory = _memory(max_carried_unverified=3, min_support=100)
+    ids = [_add(memory, f"claim {i}", f"C{i}") for i in range(5)]
+    supports = {"C0": 5, "C1": 1, "C2": 1, "C3": 9, "C4": 1}
+    runner = FakeRunner({code: dict(PASS, support=value) for code, value in supports.items()})
+    memory.mark_review_pending(1, "level_completed")
+    (summary,) = _review(memory, HISTORY_L1, runner)
+    statuses = {hid: memory.get(hid).status for hid in ids}
+    assert statuses[ids[3]] == statuses[ids[0]] == statuses[ids[4]] == "unverified"
+    assert statuses[ids[1]] == statuses[ids[2]] == "dropped"
+    assert sorted(summary["dropped"]) == sorted([ids[1], ids[2]])
+
+
+def test_truncated_post_level_reply_keeps_cause_and_complete_hypotheses():
+    from inference.agent.level_memory import parse_post_level_response
+
+    reply = (
+        '{\n  "cause": "The player entered the \\"goal\\" box at step 30.",\n  "hypotheses": [\n'
+        '    {"text": "entering the box wins", "kind": "goal", "check_code": "def check_transition(t):\\n    return None"},\n'
+        '    {"text": "the + rotates the indicator", "kind": "rule", "check_code": "def check_transition(t):\\n    if t.act'
+    )
+    parsed = parse_post_level_response(reply)
+    assert parsed["truncated"] is True
+    assert parsed["cause"] == 'The player entered the "goal" box at step 30.'
+    assert [h["text"] for h in parsed["hypotheses"]] == ["entering the box wins"]
+    complete = parse_post_level_response(json.dumps({"cause": "c", "hypotheses": []}))
+    assert complete["truncated"] is False and complete["cause"] == "c"
+
+
+def test_truncated_reply_is_flagged_in_summary():
+    memory = _memory()
+    memory.mark_review_pending(1, "level_completed")
+    reply = '{"cause": "won by the last RIGHT", "hypotheses": [{"text": "RIGHT moves blue right", "kind": "rule", "check_code": "GOOD"}, {"text": "cut'
+    (summary,) = _review(memory, HISTORY_L1, FakeRunner({"GOOD": PASS}), llm_call=lambda m, t: reply)
+    assert summary["llm"].startswith("ran (reply truncated")
+    assert summary["cause"] == "won by the last RIGHT"
+    assert summary["reviewer_hypotheses"] == ["H1"]

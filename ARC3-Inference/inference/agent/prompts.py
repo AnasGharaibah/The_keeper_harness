@@ -107,10 +107,30 @@ PREDICTION_CHECK_ADDENDUM = (
     "- The harness checks it against the real result and reports `confirmed` or `WRONG` with the exact diff in the tool result's `prediction_check`, in `last_prediction`, and in `prediction_log`. WRONG means your model of that action is wrong: revise it before relying on it.\n"
 )
 
+AUTO_PREDICTION_ADDENDUM = (
+    "- An action without `expect=` is reported as `no_prediction`: it tests nothing.\n"
+    "- The harness also auto-predicts every action: it expects the same effect the same action had last time on this level (timer/HUD cells that change every step are ignored). Differences appear as `SURPRISE:` lines in the tool result's `auto_prediction`. A SURPRISE means your model of that action is incomplete: find out what was different before relying on it.\n"
+)
+
 LEVEL_REVIEW_ADDENDUM = (
     "\n\nRules and goals memory:\n"
     "- Record a claimed rule or goal from Python with `hypothesis(text, kind='rule' or 'goal', check_code=None)`. `check_code` is Python source defining `check_transition(t)` that returns True (claim held), False (violated) or None (does not apply) for one transition `t` (`t.action`, `t.before_frame`, `t.after_frame`, `t.result`). Helpers: `cell(frame, row, col)`, `changed_cells(a, b)` -> [(row, col, old, new)], `parse_action(t.action)` -> (name, row, col).\n"
     "- After each level the harness runs every check on all of that level's transitions. A claim becomes a VERIFIED FACT only if its check passes, applies to enough transitions, and fails on harness-perturbed transitions. Facts stay pinned at the top of your context across levels; facts that later fail move to REFUTED.\n"
+)
+
+BATCH_ADDENDUM = (
+    "- A multi-action call reports `batch_summary`: what each run of actions did, e.g. `LEFT x15: blocked -> step 48: RESET (board back to level start) -> LEFT x3: moved [0,-5] each`. `blocked` means nothing changed outside the HUD; a RESET is the level restarting (e.g. the step budget ran out), not an effect of the action.\n"
+    "- A batch can be stopped early (`batch_stopped`) when the level resets, a move is blocked twice in a row, or a repeated action does something surprising. The remaining actions were NOT executed: re-plan from the current state.\n"
+)
+
+PERCEPTION_ADDENDUM = (
+    "- `auto_prediction` also lists what the harness perceives: objects that were ROTATED / FLIPPED / SCALED / RECOLORED, an object that starts or stops MATCHING another object's shape (up to rotation and scale), and ROLES (which objects move with the arrow keys and which never do). These are observations, not explanations: work out what caused them and whether they matter for the goal.\n"
+)
+
+WORLD_MODEL_ADDENDUM = (
+    "\n\nWorking world model memory:\n"
+    "- Your private reasoning is NOT kept between turns. To remember, call `world_model(text)` from Python whenever your understanding changes: the entities and what they seem to be, what each action does, how things are connected (e.g. 'touching X changes Y'), the likely goal, and open questions. Call `plan(text)` for your next steps.\n"
+    "- The harness stores both and shows them back to you at the start of every turn. Rewrite the whole text each time (it replaces the old one).\n"
 )
 
 COMPACT_TOOL_SESSION_ADDENDUM = (

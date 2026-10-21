@@ -646,6 +646,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     if t.before_frame is not None
                     and t.before_frame.level == level
                     and parse_action(t.action)[0] != "RESET"
+                    and not (t.result or {}).get("reset")
                 ]
                 started = time.monotonic()
                 reply["quick_check"] = _evaluate_check(
@@ -656,8 +657,26 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             hypotheses.append(record)
             return reply
 
+        notes = {}
+
+        def _store_note(key, text):
+            text = str(text or "").strip()
+            if not text:
+                raise ValueError(f"{key}(text) needs non-empty text.")
+            notes[key] = text[:2000]
+            return {"stored": key, "chars": len(notes[key])}
+
+        def world_model(text):
+            return _store_note("world_model", text)
+
+        def plan(text):
+            return _store_note("plan", text)
+
         runtime_globals["action"] = action
         runtime_globals["hypothesis"] = hypothesis
+        if initial_state.get("world_model_enabled"):
+            runtime_globals["world_model"] = world_model
+            runtime_globals["plan"] = plan
         runtime_globals["cell"] = cell
         runtime_globals["changed_cells"] = changed_cells
         runtime_globals["parse_action"] = parse_action
@@ -674,6 +693,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
                     "hypotheses": _json_safe(hypotheses),
+                    "notes": _json_safe(notes),
                 }
             )
         except Exception as exc:
@@ -684,6 +704,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
                     "hypotheses": _json_safe(hypotheses),
+                    "notes": _json_safe(notes),
                 }
             )
 
@@ -871,6 +892,7 @@ def run_sandboxed_python(
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "hypotheses": list(message.get("hypotheses") or []),
+                    "notes": dict(message.get("notes") or {}),
                 }
 
             _wait_for_process_exit(process)

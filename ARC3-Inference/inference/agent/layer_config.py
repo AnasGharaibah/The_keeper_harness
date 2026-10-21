@@ -41,13 +41,94 @@ class PredictionCheckConfig:
     enabled: bool = False
     max_wrong_diffs_shown: int = 5
     sandbox_log_size: int = 20
+    # Loud reminder after this many consecutive executed actions without expect= (0 = off).
+    nudge_after_actions: int = 5
+    # Harness predicts "same effect as the last same action on this level" (no LLM).
+    auto_predict: bool = True
+    # Cells changing in at least this fraction of a level's transitions are HUD and ignored.
+    hud_change_fraction: float = 0.8
+    max_surprises_shown: int = 5  # distinct surprise kinds shown per call
+    # Perception lines (transformations, shape matches, roles) in auto_prediction.
+    perception: bool = True
+    perception_min_size: int = 3
+    perception_max_lines: int = 3
+    # Label in-level resets (board back to level start) as RESET, never as an action effect.
+    reset_detection: bool = True
+    # Per-step summary of multi-action calls ("LEFT x15: blocked -> step 48: RESET -> ...").
+    batch_summary: bool = True
+    batch_summary_max_chars: int = 400
+    # Early stop of a multi-action call; the remaining actions are not sent to the game.
+    batch_stop: bool = True
+    stop_on_reset: bool = True
+    stop_after_blocked: int = 2  # consecutive blocked moves (0 = off)
+    stop_on_surprise_repeated: bool = True  # batch of one repeated action
+    stop_on_surprise_mixed: bool = False  # batch of mixed actions
 
     @classmethod
     def from_env(cls) -> "PredictionCheckConfig":
+        defaults = cls()
         return cls(
             enabled=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_ENABLED", False),
             max_wrong_diffs_shown=max(0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_MAX_WRONG_DIFFS", 5)),
             sandbox_log_size=max(0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_SANDBOX_LOG_SIZE", 20)),
+            nudge_after_actions=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_NUDGE_AFTER_ACTIONS", defaults.nudge_after_actions)
+            ),
+            auto_predict=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_AUTO_PREDICT", defaults.auto_predict),
+            hud_change_fraction=min(
+                1.0,
+                max(0.0, _env_float("LOCAL_ANALYZER_PREDICTION_CHECK_HUD_CHANGE_FRACTION", defaults.hud_change_fraction)),
+            ),
+            max_surprises_shown=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_MAX_SURPRISES_SHOWN", defaults.max_surprises_shown)
+            ),
+            perception=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION", defaults.perception),
+            perception_min_size=max(
+                1, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION_MIN_SIZE", defaults.perception_min_size)
+            ),
+            perception_max_lines=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_PERCEPTION_MAX_LINES", defaults.perception_max_lines)
+            ),
+            reset_detection=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_RESET_DETECTION", defaults.reset_detection),
+            batch_summary=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_SUMMARY", defaults.batch_summary),
+            batch_summary_max_chars=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_SUMMARY_MAX_CHARS", defaults.batch_summary_max_chars)
+            ),
+            batch_stop=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_BATCH_STOP", defaults.batch_stop),
+            stop_on_reset=_env_bool("LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_RESET", defaults.stop_on_reset),
+            stop_after_blocked=max(
+                0, _env_int("LOCAL_ANALYZER_PREDICTION_CHECK_STOP_AFTER_BLOCKED", defaults.stop_after_blocked)
+            ),
+            stop_on_surprise_repeated=_env_bool(
+                "LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_SURPRISE_REPEATED", defaults.stop_on_surprise_repeated
+            ),
+            stop_on_surprise_mixed=_env_bool(
+                "LOCAL_ANALYZER_PREDICTION_CHECK_STOP_ON_SURPRISE_MIXED", defaults.stop_on_surprise_mixed
+            ),
+        )
+
+
+_WORLD_MODEL_PREFIX = "LOCAL_ANALYZER_WORLD_MODEL_"
+
+
+@dataclass(frozen=True)
+class WorldModelConfig:
+    """``world_model(text)`` / ``plan(text)`` in the sandbox, stored by the harness
+    and re-injected every turn."""
+
+    enabled: bool = False
+    # Reminder in the user prompt after this many turns without world_model() (0 = off).
+    nudge_after_turns: int = 3
+    # Without a world_model() call, take the last "World model:" / "Plan:" lines from the reasoning.
+    reasoning_fallback: bool = True
+
+    @classmethod
+    def from_env(cls) -> "WorldModelConfig":
+        defaults = cls()
+        return cls(
+            enabled=_env_bool(f"{_WORLD_MODEL_PREFIX}ENABLED", defaults.enabled),
+            nudge_after_turns=max(0, _env_int(f"{_WORLD_MODEL_PREFIX}NUDGE_AFTER_TURNS", defaults.nudge_after_turns)),
+            reasoning_fallback=_env_bool(f"{_WORLD_MODEL_PREFIX}REASONING_FALLBACK", defaults.reasoning_fallback),
         )
 
 
@@ -72,6 +153,17 @@ class LevelReviewConfig:
     quick_check_seconds: float = 3.0
     max_review_transitions: int = 300
     max_hypotheses: int = 60
+    # "LEARNED LAST LEVEL" block: review cause sentence plus untested ideas.
+    learned_block: bool = True
+    max_untested_shown: int = 3
+    # One LLM call after every level end, even with no agent hypotheses: states the
+    # likely cause of the win/death and proposes hypotheses (source="reviewer").
+    post_level_review: bool = True
+    max_reviewer_hypotheses: int = 5
+    # Per-move summaries in the review prompt (consecutive identical effects merged).
+    max_review_moves: int = 60
+    # Open hypotheses with check code carried across levels (0 = no cap).
+    max_carried_unverified: int = 10
 
     @classmethod
     def from_env(cls) -> "LevelReviewConfig":
@@ -109,4 +201,16 @@ class LevelReviewConfig:
                 1, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEW_TRANSITIONS", defaults.max_review_transitions)
             ),
             max_hypotheses=max(1, _env_int(f"{_REVIEW_PREFIX}MAX_HYPOTHESES", defaults.max_hypotheses)),
+            learned_block=_env_bool(f"{_REVIEW_PREFIX}LEARNED_BLOCK", defaults.learned_block),
+            max_untested_shown=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_UNTESTED_SHOWN", defaults.max_untested_shown)
+            ),
+            post_level_review=_env_bool(f"{_REVIEW_PREFIX}POST_LEVEL_REVIEW", defaults.post_level_review),
+            max_reviewer_hypotheses=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEWER_HYPOTHESES", defaults.max_reviewer_hypotheses)
+            ),
+            max_review_moves=max(1, _env_int(f"{_REVIEW_PREFIX}MAX_REVIEW_MOVES", defaults.max_review_moves)),
+            max_carried_unverified=max(
+                0, _env_int(f"{_REVIEW_PREFIX}MAX_CARRIED_UNVERIFIED", defaults.max_carried_unverified)
+            ),
         )

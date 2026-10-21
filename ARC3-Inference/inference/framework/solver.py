@@ -34,7 +34,7 @@ from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
     write_runtime_state,
 )
-from inference.agent.prediction import compare_expectation, unchecked_prediction
+from inference.agent.prediction import compare_expectation, no_prediction_result
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
@@ -644,6 +644,11 @@ class _HarnessGameSession:
             return self._terminal_payload(requested_actions)
 
         expect = arguments.get("expect")
+        # Optional in-process hook from the agent: called after each executed action
+        # except the last; a non-empty string stops the batch there (the remaining
+        # actions are never sent to the game).
+        continue_check = arguments.get("continue_check")
+        early_stop_detail: str | None = None
         before_grid = (
             _grid_from_state(self.game.current_state) if expect is not None else None
         )
@@ -691,6 +696,14 @@ class _HarnessGameSession:
             if payload.get("level_completed"):
                 stop_reason = "level_completed"
                 break
+            if callable(continue_check) and batch_index < batch_size:
+                try:
+                    early_stop_detail = continue_check(payload, batch_index, batch_size) or None
+                except Exception:  # noqa: BLE001 - a broken hook must never break an action
+                    early_stop_detail = None
+                if early_stop_detail:
+                    stop_reason = "early_stop"
+                    break
 
         if not executed_payloads:
             return self._error_payload("No action was executed.")
@@ -727,6 +740,8 @@ class _HarnessGameSession:
         ]
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
+        if early_stop_detail:
+            final_payload["stop_detail"] = early_stop_detail
         if expect is not None:
             final_payload["prediction"] = self._check_expectation(
                 expect, before_grid, final_payload
@@ -748,7 +763,7 @@ class _HarnessGameSession:
                 result=final_payload,
             )
         except Exception as exc:
-            prediction = unchecked_prediction(f"check error: {type(exc).__name__}")
+            prediction = no_prediction_result(f"check error: {type(exc).__name__}")
         # Annotate the batch's last action event before it is flushed to the
         # append-only events sidecar, so the viewer can show the verdict.
         for event in reversed(self.viewer_events):

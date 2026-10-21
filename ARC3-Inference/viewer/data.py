@@ -1467,7 +1467,7 @@ def _prediction_summary(actions: list[dict[str, Any]]) -> dict[str, Any]:
     if confirmed:
         parts.append(f"✓ {confirmed} confirmed")
     if not parts:
-        parts.append(f"{len(verdicts)} unchecked")
+        parts.append(f"{len(verdicts)} no prediction")
     summary: dict[str, Any] = {"predictionLabel": " · ".join(parts)}
     first_diff = next((str(action.get("prediction_diff")) for action in actions if action.get("prediction_diff")), "")
     if first_diff:

@@ -67,7 +67,22 @@
     "prediction_check": {
       "enabled": true,
       "max_wrong_diffs_shown": 5,
-      "sandbox_log_size": 20
+      "sandbox_log_size": 20,
+      "nudge_after_actions": 5,
+      "auto_predict": true,
+      "hud_change_fraction": 0.8,
+      "max_surprises_shown": 5,
+      "perception": true,
+      "perception_min_size": 3,
+      "perception_max_lines": 3,
+      "reset_detection": true,
+      "batch_summary": true,
+      "batch_summary_max_chars": 400,
+      "batch_stop": true,
+      "stop_on_reset": true,
+      "stop_after_blocked": 2,
+      "stop_on_surprise_repeated": true,
+      "stop_on_surprise_mixed": false
     },
     "level_review": {
       "enabled": true,
@@ -85,7 +100,18 @@
       "check_timeout_seconds": 10,
       "quick_check_seconds": 3,
       "max_review_transitions": 300,
-      "max_hypotheses": 60
+      "max_hypotheses": 60,
+      "learned_block": true,
+      "max_untested_shown": 3,
+      "post_level_review": true,
+      "max_reviewer_hypotheses": 5,
+      "max_review_moves": 60,
+      "max_carried_unverified": 10
+    },
+    "world_model": {
+      "enabled": true,
+      "nudge_after_turns": 3,
+      "reasoning_fallback": true
     }
   },
   "chat": {

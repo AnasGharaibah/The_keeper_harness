@@ -44,9 +44,9 @@ def test_components_match_segmentation_ids_and_hashes():
     ]
 
 
-def test_no_expectation_is_unchecked():
+def test_no_expectation_is_no_prediction():
     report = compare_expectation(None, before_grid=BEFORE, after_grid=MOVED_RIGHT, result=FLAGS_CHANGED)
-    assert report["verdict"] == "unchecked"
+    assert report["verdict"] == "no_prediction"
     assert report["failures"] == []
 
 
@@ -123,7 +123,7 @@ def test_appears_free_text_is_not_checked():
     report = compare_expectation(
         {"appears": ["a door opens"]}, before_grid=BEFORE, after_grid=MOVED_RIGHT, result=FLAGS_CHANGED
     )
-    assert report["verdict"] == "unchecked"
+    assert report["verdict"] == "no_prediction"
     assert any("free text" in item for item in report["skipped"])
 
 
@@ -156,7 +156,7 @@ def test_cells_all_forms():
 
 def test_note_is_stored_not_checked():
     report = compare_expectation({"note": "the block slides"}, before_grid=BEFORE, after_grid=MOVED_RIGHT, result=FLAGS_CHANGED)
-    assert report["verdict"] == "unchecked"
+    assert report["verdict"] == "no_prediction"
     assert report["note"] == "the block slides"
 
 
@@ -179,7 +179,7 @@ def test_bad_values_never_raise():
     )
     assert normalized == {}
     assert len(problems) == 4
-    assert compare_expectation("not a dict", before_grid=BEFORE, after_grid=BEFORE, result={})["verdict"] == "unchecked"
+    assert compare_expectation("not a dict", before_grid=BEFORE, after_grid=BEFORE, result={})["verdict"] == "no_prediction"
 
 
 def test_summary_one_line_per_call_and_long_loops():
@@ -192,7 +192,7 @@ def test_summary_one_line_per_call_and_long_loops():
     ]
     many = [dict(ok, action_num=i) for i in range(10)] + [dict(wrong, action_num=20 + i) for i in range(4)]
     summary = summarize_predictions(many, max_wrong_diffs_shown=2)
-    assert summary[0] == "14 action() calls: 10 confirmed / 4 wrong / 0 unchecked"
+    assert summary[0] == "14 action() calls: 10 confirmed / 4 wrong / 0 no_prediction"
     assert len(summary) == 4 and summary[-1] == "... 2 more wrong"
-    unchecked = summarize_predictions([{"verdict": "unchecked", "actions": ["UP"]}] * 3)
-    assert unchecked == ["3 action() call(s), none passed expect= (unchecked)"]
+    none_passed = summarize_predictions([{"verdict": "no_prediction", "actions": ["UP"]}] * 3)
+    assert none_passed == ["3 action() call(s), none passed expect= (no_prediction)"]
