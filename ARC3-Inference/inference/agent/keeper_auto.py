@@ -177,16 +177,16 @@ def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) ->
     found: list[tuple[tuple[str, str], str]] = []
     for key in ("level_completed", "game_over"):
         if current[key] and not previous[key]:
-            found.append(((key, ""), f"{action} caused {key} (it did not last time)"))
+            found.append(((key, ""), f"it caused {key} this time, not last time"))
     if current["level_completed"] or current["game_over"]:
         return found
     if is_toggle_back(previous, current):
         return found
     if previous["board_changed"] != current["board_changed"]:
         if previous["board_changed"]:
-            found.append((("blocked", ""), f"{action} changed the board last time, this time nothing changed"))
+            found.append((("blocked", ""), "it changed the board last time, nothing this time"))
         else:
-            found.append((("unblocked", ""), f"{action} did nothing last time, this time {current['changed_cells']} cells changed"))
+            found.append((("unblocked", ""), f"it changed nothing last time, {current['changed_cells']} cells this time"))
     for object_hash, delta in previous["moves"].items():
         if object_hash not in current["present"]:
             continue
@@ -195,20 +195,20 @@ def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) ->
             found.append(
                 (
                     ("moved_differently", object_hash),
-                    f"{action} moved {_obj(object_hash, colors)} by {_delta(delta)} last time, this time {_delta(observed)}",
+                    f"{_obj(object_hash, colors)} moved by {_delta(delta)} last time, by {_delta(observed)} this time",
                 )
             )
     for object_hash, observed in current["moves"].items():
         if object_hash in previous["moves"] or object_hash not in previous["present"]:
             continue
         found.append(
-            (("moved_newly", object_hash), f"{action} moved {_obj(object_hash, colors)} by {_delta(observed)}; last time it stayed")
+            (("moved_newly", object_hash), f"{_obj(object_hash, colors)} moved by {_delta(observed)} this time; it stayed last time")
         )
-    for key, verb in (("appeared", "appear"), ("disappeared", "disappear")):
+    for key, verb in (("appeared", "appeared"), ("disappeared", "disappeared")):
         new = [h for h in current[key] if h not in previous[key]]
         if new:
             found.append(
-                ((key, ",".join(new[:2])), f"{action} made {', '.join(_obj(h, colors) for h in new[:2])} {verb} (not last time)")
+                ((key, ",".join(new[:2])), f"{', '.join(_obj(h, colors) for h in new[:2])} {verb} this time, not last time")
             )
     return found
 
@@ -281,8 +281,14 @@ def surprise_lines(
             if kind in seen:
                 continue
             seen.add(kind)
-            where = f"step {item['step']}" + (f", action {order[item['step']]}/{total}" if total > 1 else "")
-            lines.append(f"SURPRISE at {where}: {text}")
+            # Always one action against the previous single use of the same
+            # action on this level, never a whole batch: say so in the line.
+            name = " ".join(str(item["action"]).split())
+            batch = f" (action {order[item['step']]} of {total} in this call)" if total > 1 else ""
+            lines.append(
+                f"SURPRISE: single {name} at step {item['step']}{batch} vs the last single {name} "
+                f"at step {transitions[previous]['step']}: {text}"
+            )
             if len(lines) >= max_lines:
                 return lines
     return lines

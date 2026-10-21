@@ -229,8 +229,9 @@ PYTHON_ADDENDUM_TAIL = (
 # Keeper additions: one fixed sentence per enabled switch (identical in every
 # game and turn, so the shared system-prompt prefix stays cacheable).
 KEEPER_SURPRISE_ADDENDUM = (
-    "- After actions, `surprises` in the tool result lists any action that did something different "
-    "from the last time it was used on this level (same action, same cell for MOUSE).\n"
+    "- After actions, `surprises` in the tool result lists any single action that did something different "
+    "from the previous single use of the same action on this level (same cell for MOUSE). Each line names "
+    "both steps; it compares one action with one action, never whole batches.\n"
 )
 
 KEEPER_REVIEW_ADDENDUM = (

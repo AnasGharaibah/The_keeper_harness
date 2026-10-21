@@ -40,8 +40,8 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class KeeperConfig:
-    # SURPRISE lines: an action did something different from the last time it
-    # was used on this level.
+    # SURPRISE lines: a single action did something different from the previous
+    # single use of the same action on this level.
     surprise: bool = False
     surprise_max_lines: int = 3
     # Cells this close to the board edge are ignored, like the harness's own
