@@ -377,20 +377,13 @@ class KeeperMemory:
         if self.last_level is None:
             return ""
         facts = sorted((h for h in self.hypotheses if h.status == FACT), key=lambda h: (-h.support, h.id))[:8]
-        ideas = sorted(
-            (h for h in self.hypotheses if h.status == OPEN and not h.reason.startswith("unfalsifiable")),
-            key=lambda h: -h.support,
-        )[:3]
-        lines = [f"{NOTES_HEADER} (facts are checked by the harness against your recorded moves; the rest is not verified)"]
+        lines = [f"{NOTES_HEADER} (facts are checked by the harness against your recorded moves; the cause is the reviewer's reading, not checked)"]
         if facts:
             lines.append("Verified on your recorded moves (each held on the levels named; a new level can break it):")
             lines += [f"- {_held_on(h.levels_held)}: {h.text} (support {h.support})" for h in facts]
         cause = self.causes.get(self.last_level)
         if cause:
             lines.append(f"Level {self.last_level}, likely cause: {cause}")
-        if ideas:
-            lines.append("Untested ideas:")
-            lines += [f"- {h.text} (support {h.support})" for h in ideas]
         if len(lines) == 1:
             return ""
         block = "\n".join(lines)

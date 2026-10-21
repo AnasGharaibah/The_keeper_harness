@@ -80,6 +80,17 @@ def test_only_passing_falsifiable_checks_with_support_become_facts():
     assert "anything holds" not in block  # unfalsifiable ideas are not shown
 
 
+def test_open_ideas_are_never_shown_only_facts_and_the_cause():
+    memory = keeper_review.KeeperMemory(min_support=50, max_open=10, max_hypotheses=5)  # nothing can become a fact
+    memory.apply(1, _reply("the last RIGHT reached the exit",
+                           [{"text": "RIGHT moves the player one column", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}]),
+                 _transitions(), _check)
+    assert memory.hypotheses[0].status == "open" and memory.hypotheses[0].support > 0
+    block = memory.notes_block()
+    assert "Level 1, likely cause: the last RIGHT reached the exit" in block
+    assert "RIGHT moves the player" not in block and "idea" not in block.lower()
+
+
 def test_open_hypotheses_carry_to_the_next_level_and_facts_get_demoted():
     memory = keeper_review.KeeperMemory(min_support=10, max_open=10, max_hypotheses=5)
     reply = _reply("c", [{"text": "RIGHT shifts by one", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}])
