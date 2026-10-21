@@ -39,8 +39,8 @@ _BOOTSTRAP = textwrap.dedent(
 
     SAFE_MODULES = {"collections", "itertools", "math", "re", "json", "functools", "statistics"}
     SAFE_BUILTINS = {
-        "abs", "all", "any", "bool", "dict", "enumerate", "Exception", "filter", "float", "frozenset",
-        "getattr", "hasattr", "int", "isinstance", "len", "list", "map", "max", "min", "next", "range",
+        "abs", "all", "any", "bool", "chr", "dict", "divmod", "enumerate", "Exception", "filter", "float", "frozenset",
+        "getattr", "hasattr", "int", "isinstance", "len", "list", "map", "max", "min", "next", "ord", "range",
         "reversed", "round", "set", "sorted", "str", "sum", "tuple", "zip", "KeyError", "IndexError",
         "TypeError", "ValueError",
     }
@@ -75,6 +75,15 @@ _BOOTSTRAP = textwrap.dedent(
             self.before_frame = before_frame
             self.after_frame = after_frame
             self.result = dict(result or {})
+
+        # the level the move was made on, and its step (checks often reach for these)
+        @property
+        def level(self):
+            return self.before_frame.level
+
+        @property
+        def step(self):
+            return self.after_frame.step
 
 
     def cell(frame, row, col):
@@ -119,7 +128,9 @@ _BOOTSTRAP = textwrap.dedent(
     def _load(check_code):
         safe = {name: getattr(builtins, name) for name in SAFE_BUILTINS}
         safe["__import__"] = _safe_import
-        namespace = {"__builtins__": safe, "cell": cell, "changed_cells": changed_cells, "parse_action": parse_action}
+        import collections, itertools, math, re
+        namespace = {"__builtins__": safe, "cell": cell, "changed_cells": changed_cells, "parse_action": parse_action,
+                     "collections": collections, "itertools": itertools, "math": math, "re": re}
         exec(compile(str(check_code or ""), "<check>", "exec"), namespace)
         fn = namespace.get("check_transition")
         if not callable(fn):

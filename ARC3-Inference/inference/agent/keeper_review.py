@@ -38,11 +38,11 @@ Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_
 
 # The whole check API, with two examples that run as written (tests execute them).
 CHECK_API = """Check API (nothing else exists; no harness tools like frame_diff):
-- t.action: 'RIGHT', 'SPACE' or 'MOUSE(row=4, col=7)'. parse_action(t.action) -> (name, row, col); row and col are None for keys.
+- t.action: 'RIGHT', 'SPACE' or 'MOUSE(row=4, col=7)'. parse_action(t.action) -> (name, row, col); row and col are None for keys. t.level, t.step: the move's level and step.
 - t.before_frame, t.after_frame: .ascii (rows joined by newlines, one colour letter per cell: W w g G c B M P R b S Y O r N p), .level, .step, .segmentation.
 - t.result: dict with level_completed, game_over, board_changed.
 - cell(frame, row, col) -> colour letter or None. changed_cells(before, after) -> list of (row, col, old, new): four values per item.
-- Import what you use (collections, itertools, math, re, json, functools, statistics). At most 12 lines, no comments.
+- re, math, collections and itertools are already imported; json, functools and statistics can be imported. At most 12 lines, no comments.
 Example rule, "RIGHT moves the pink piece one column right":
 def check_transition(t):
     if parse_action(t.action)[0] != 'RIGHT' or t.result.get('level_completed'):

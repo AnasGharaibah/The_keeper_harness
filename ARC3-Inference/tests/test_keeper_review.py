@@ -301,7 +301,7 @@ def _review_with(tmp_path, monkeypatch, replies):
     return agent, calls, json.loads(transcript[-1][1])
 
 
-BROKEN = "def check_transition(t):\n    return t.level > 0\n"
+BROKEN = "def check_transition(t):\n    return frame_diff(t) is not None\n"
 
 
 def test_a_crashed_check_is_re_asked_once_with_its_error_and_then_judged(tmp_path, monkeypatch):
@@ -311,7 +311,7 @@ def test_a_crashed_check_is_re_asked_once_with_its_error_and_then_judged(tmp_pat
     assert len(calls) == 2
     ask = calls[1]["messages"]
     assert ask[-2] == {"role": "assistant", "content": first}  # same conversation, cached prefix
-    assert ask[-1]["content"].startswith("KEEPER CHECK FIX") and "'TransitionView' object has no attribute 'level'" in ask[-1]["content"]
+    assert ask[-1]["content"].startswith("KEEPER CHECK FIX") and "NameError: name 'frame_diff' is not defined" in ask[-1]["content"]
     assert calls[1]["enable_thinking"] is False
     (h,) = agent._keeper_memory.hypotheses
     assert h.status in ("open", "fact") and h.check_code == RIGHT_MOVES_PLAYER.strip() and h.support > 0
@@ -322,7 +322,7 @@ def test_a_crashed_check_is_re_asked_once_with_its_error_and_then_judged(tmp_pat
 
 def test_a_check_that_still_crashes_is_dropped_and_no_third_request_is_made(tmp_path, monkeypatch):
     first = _reply("cause", [{"text": "a", "kind": "rule", "check_code": BROKEN},
-                             {"text": "b", "kind": "rule", "check_code": BROKEN.replace("level", "lvl")}])
+                             {"text": "b", "kind": "rule", "check_code": BROKEN.replace("frame_diff", "frame_change")}])
     fix = json.dumps({"fixes": [{"id": "K1", "check_code": BROKEN}]})  # K2 gets no fix
     agent, calls, summary = _review_with(tmp_path, monkeypatch, [first, fix])
     assert len(calls) == 2
@@ -336,3 +336,19 @@ def test_no_retry_request_when_every_check_runs(tmp_path, monkeypatch):
     first = _reply("cause", [{"text": "RIGHT moves", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}])
     _agent, calls, summary = _review_with(tmp_path, monkeypatch, [first])
     assert len(calls) == 1 and "retried" not in summary
+
+
+def test_the_check_api_has_what_crashed_checks_reached_for():
+    # 66 crashes used t.level, 29 chr(), 21 used re without importing it.
+    code = (
+        "def check_transition(t):\n"
+        "    if t.level != 1 or t.step < 1:\n"
+        "        return None\n"
+        "    return ord(chr(80)) == 80 and bool(re.match(r'RIGHT', t.action)) and math.isfinite(1.0)\n"
+    )
+    report = _check(code, _transitions(), False)
+    assert report["status"] == "pass" and report["support"] == 4
+    assert "t.level, t.step" in keeper_review.CHECK_API and "already imported" in keeper_review.CHECK_API
+    # still sandboxed: no os, no open
+    assert _check("import os\ndef check_transition(t):\n    return True\n", _transitions(), False)["status"] == "error"
+    assert _check("def check_transition(t):\n    return open('/etc/passwd') is None\n", _transitions(), False)["status"] == "error"
