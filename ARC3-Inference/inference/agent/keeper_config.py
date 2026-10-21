@@ -65,6 +65,11 @@ class KeeperConfig:
     perception: bool = False
     perception_max_lines: int = 3
     perception_min_size: int = 3
+    # Timing log: one JSON line per turn in the run artifacts (keeper_timing).
+    # Records only; requests are unchanged unless timing_stream is also on, which
+    # streams replies so the first token's arrival (queue + prefill) is measured.
+    timing: bool = False
+    timing_stream: bool = False
 
     @property
     def any_observation(self) -> bool:
@@ -94,4 +99,6 @@ class KeeperConfig:
             perception=_env_bool("KEEPER_PERCEPTION", defaults.perception),
             perception_max_lines=max(1, _env_int("KEEPER_PERCEPTION_MAX_LINES", defaults.perception_max_lines)),
             perception_min_size=max(1, _env_int("KEEPER_PERCEPTION_MIN_SIZE", defaults.perception_min_size)),
+            timing=_env_bool("KEEPER_TIMING", defaults.timing),
+            timing_stream=_env_bool("KEEPER_TIMING_STREAM", defaults.timing_stream),
         )

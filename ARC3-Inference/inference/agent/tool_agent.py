@@ -70,7 +70,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent import keeper_auto, keeper_perception, keeper_review
+from inference.agent import keeper_auto, keeper_perception, keeper_review, keeper_timing
 from inference.agent.keeper_check_sandbox import run_check as keeper_run_check
 from inference.agent.keeper_config import KeeperConfig
 from inference.utils.grid_utils import ARC_COLOR_CHARS
@@ -3471,6 +3471,14 @@ class _ChatCompletionResult:
     served_by: str = ""
 
 
+def _note_first_data_line(lines, probe: dict[str, float]):
+    """Pass SSE lines through, noting when the first data line arrived."""
+    for line in lines:
+        if "at" not in probe and line and not bytes(line).startswith(b":"):
+            probe["at"] = time.monotonic()
+        yield line
+
+
 class ToolAgent:
     """Direct tool-calling analyzer compatible with OpenAI-style endpoints."""
 
@@ -5230,7 +5238,26 @@ class ToolAgent:
             kwargs["reasoning_effort"] = ladder[rung]
         return kwargs
 
-    def _chat_completion(
+    def _chat_completion(self, messages: list[dict[str, Any]], **kwargs: Any) -> _ChatCompletionResult:
+        timer = getattr(self, "_keeper_timer", None)
+        if timer is None:
+            return self._post_chat_completion(messages, **kwargs)
+        probe: dict[str, float] | None = {} if self._keeper.timing_stream else None
+        self._keeper_first_token = probe
+        kind = getattr(self, "_keeper_request_kind", None) or "turn"
+        started = time.monotonic()
+        try:
+            result = self._post_chat_completion(messages, **kwargs)
+        except Exception:
+            timer.add_request(f"{kind}_error", time.monotonic() - started, None)
+            raise
+        finally:
+            self._keeper_first_token = None
+        first = probe["at"] - started if probe and "at" in probe else None
+        timer.add_request(kind, time.monotonic() - started, result.usage, first)
+        return result
+
+    def _post_chat_completion(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -5277,6 +5304,12 @@ class ToolAgent:
                 evicted=getattr(self, "_has_evicted", False),
             )
         )
+        probe = getattr(self, "_keeper_first_token", None)
+        if probe is not None:
+            # KEEPER_TIMING_STREAM: stream so the first token's arrival can be timed
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
             return requests.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
@@ -5333,9 +5366,10 @@ class ToolAgent:
             # clean and only long streamed replies are corrupted. The assembler
             # already decodes bytes itself, and a complete SSE line is always a
             # whole UTF-8 sequence, so hand it raw bytes instead.
-            payload = assemble_streamed_chat_response(
-                response.iter_lines(decode_unicode=False)
-            )
+            lines = response.iter_lines(decode_unicode=False)
+            if probe is not None:
+                lines = _note_first_data_line(lines, probe)
+            payload = assemble_streamed_chat_response(lines)
         else:
             payload = response.json()
         choices = payload.get("choices", [])
@@ -5483,6 +5517,9 @@ class ToolAgent:
             # there anyway, so re-adding it costs no extra prefill).
             if fresh or not delivered:
                 self._keeper_block = block
+                timer = getattr(self, "_keeper_timer", None)
+                if timer is not None:
+                    timer.add_chars("notes", block)
                 return f"{block}\n\n{user_prompt}"
             return user_prompt
         except Exception as exc:  # noqa: BLE001 - the review must never break a turn
@@ -5514,13 +5551,17 @@ class ToolAgent:
         timeout = float(keeper.review_time_budget_seconds)
         if request_timeout_seconds is not None:
             timeout = min(timeout, float(request_timeout_seconds))
-        result = self._chat_completion(
-            messages,
-            tools=self._tools(state_path),
-            max_tokens=keeper.review_max_tokens,
-            enable_thinking=False,
-            request_timeout_seconds=timeout,
-        )
+        self._keeper_request_kind = "review"
+        try:
+            result = self._chat_completion(
+                messages,
+                tools=self._tools(state_path),
+                max_tokens=keeper.review_max_tokens,
+                enable_thinking=False,
+                request_timeout_seconds=timeout,
+            )
+        finally:
+            self._keeper_request_kind = None
         usage = getattr(result, "usage", None)
         generated_before = self._session_generated_tokens
         # Real GPU time: counted in the session total, but not toward this turn's
@@ -5535,7 +5576,8 @@ class ToolAgent:
             reply = str(message.get("reasoning_content") or message.get("reasoning") or "")
 
         def check(code: str, items: list[dict[str, Any]], perturb: bool) -> dict[str, Any]:
-            return keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
+            with self._keeper_timing("keeper_seconds"):
+                return keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
 
         summary = memory.apply(level, reply, transitions, check, deadline=deadline)
         crashed = memory.crashed(summary)
@@ -5547,13 +5589,17 @@ class ToolAgent:
                             {"role": "user", "content": memory.fix_request_text(crashed)}]
             fix_timeout = remaining if request_timeout_seconds is None else min(remaining, float(request_timeout_seconds))
             fix_before = self._session_generated_tokens
-            fix_result = self._chat_completion(
-                fix_messages,
-                tools=self._tools(state_path),
-                max_tokens=keeper.review_max_tokens,
-                enable_thinking=False,
-                request_timeout_seconds=fix_timeout,
-            )
+            self._keeper_request_kind = "review_fix"
+            try:
+                fix_result = self._chat_completion(
+                    fix_messages,
+                    tools=self._tools(state_path),
+                    max_tokens=keeper.review_max_tokens,
+                    enable_thinking=False,
+                    request_timeout_seconds=fix_timeout,
+                )
+            finally:
+                self._keeper_request_kind = None
             self._accumulate_usage_tokens(getattr(fix_result, "usage", None), count_toward_turn=False)
             self._tokens_at_level_start = getattr(self, "_tokens_at_level_start", 0) + (
                 self._session_generated_tokens - fix_before
@@ -6169,7 +6215,12 @@ class ToolAgent:
         step_executed = any(bool(item.get("executed")) for item in action_results)
         keeper = getattr(self, "_keeper", None)
         if step_executed and keeper is not None and keeper.any_observation:
-            self._keeper_observe(state_path, current_frame, payload)
+            with self._keeper_timing("keeper_seconds"):
+                self._keeper_observe(state_path, current_frame, payload)
+            timer = getattr(self, "_keeper_timer", None)
+            if timer is not None:
+                timer.add_chars("surprises", payload.get("surprises"))
+                timer.add_chars("perceived", payload.get("perceived"))
         if step_executed and keeper is not None and keeper.review:
             ended = next(
                 (
@@ -6331,13 +6382,17 @@ class ToolAgent:
         # paths share that behavior; the summary exchange is excluded from this clock.
         self._summary_context_tokens_since_attempt = 0
         try:
-            result = self._chat_completion(
-                messages,
-                tools=tools,
-                max_tokens=_summary_max_gen_tokens(self._max_output_tokens),
-                enable_thinking=_summary_enable_thinking(),
-                request_timeout_seconds=request_timeout_seconds,
-            )
+            self._keeper_request_kind = "summary"
+            try:
+                result = self._chat_completion(
+                    messages,
+                    tools=tools,
+                    max_tokens=_summary_max_gen_tokens(self._max_output_tokens),
+                    enable_thinking=_summary_enable_thinking(),
+                    request_timeout_seconds=request_timeout_seconds,
+                )
+            finally:
+                self._keeper_request_kind = None
         except BaseException as exc:  # a failed summary must not end the turn
             log.warning("rolling summary request failed: %s", exc)
             return
@@ -6665,7 +6720,8 @@ class ToolAgent:
         self._priority_next = estimate + _PRIORITY_BAND
         if gate is not None:
             _diag(self, "gate")
-            gate.handover(estimate, snapshot)
+            with self._keeper_timing("gate_wait_seconds"):
+                gate.handover(estimate, snapshot)
 
     def _in_endgame(self) -> bool:
         """Whether this game has been running long enough to switch phase.
@@ -6811,7 +6867,27 @@ class ToolAgent:
         self._note_history_evicted()
         return [system_message, *history]
 
-    def analyze(
+    def analyze(self, state_path: Path, action_num: int, *args: Any, **kwargs: Any) -> AnalyzerTurnResult | None:
+        """One analyzer turn. With KEEPER_TIMING on, the turn's timing record is
+        written to the run artifacts when it ends (see keeper_timing)."""
+        keeper = getattr(self, "_keeper", None)
+        if keeper is None or not keeper.timing:
+            return self._analyze_turn(state_path, action_num, *args, **kwargs)
+        self._keeper_timer = keeper_timing.TurnTimer(
+            keeper_timing.timing_path(state_path), analysis_step=kwargs.get("analysis_step"), action_num=action_num
+        )
+        try:
+            return self._analyze_turn(state_path, action_num, *args, **kwargs)
+        finally:
+            timer, self._keeper_timer = self._keeper_timer, None
+            timer.flush()
+
+    def _keeper_timing(self, key: str):
+        """Time a block into this turn's timing record; does nothing when timing is off."""
+        timer = getattr(self, "_keeper_timer", None)
+        return timer.measure(key) if timer is not None else keeper_timing.nothing()
+
+    def _analyze_turn(
         self,
         state_path: Path,
         action_num: int,
@@ -7326,7 +7402,8 @@ class ToolAgent:
                         f"TOOL CALL: {tool_name}",
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
-                    dispatch = self._dispatch_tool(state_path, tool_name, arguments)
+                    with self._keeper_timing("tool_seconds"):
+                        dispatch = self._dispatch_tool(state_path, tool_name, arguments)
                     if dispatch.step_executed:
                         step_executed = True
                         if self._reasoning_effort_rung >= 0 and dispatch.made_progress:
