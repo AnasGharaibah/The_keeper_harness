@@ -5538,6 +5538,31 @@ class ToolAgent:
             return keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
 
         summary = memory.apply(level, reply, transitions, check, deadline=deadline)
+        crashed = memory.crashed(summary)
+        remaining = deadline - time.monotonic()
+        if crashed and remaining > 5:
+            # One retry: the same conversation plus the errors; a check that
+            # still cannot run stays dropped.
+            fix_messages = [*messages, {"role": "assistant", "content": reply},
+                            {"role": "user", "content": memory.fix_request_text(crashed)}]
+            fix_timeout = remaining if request_timeout_seconds is None else min(remaining, float(request_timeout_seconds))
+            fix_before = self._session_generated_tokens
+            fix_result = self._chat_completion(
+                fix_messages,
+                tools=self._tools(state_path),
+                max_tokens=keeper.review_max_tokens,
+                enable_thinking=False,
+                request_timeout_seconds=fix_timeout,
+            )
+            self._accumulate_usage_tokens(getattr(fix_result, "usage", None), count_toward_turn=False)
+            self._tokens_at_level_start = getattr(self, "_tokens_at_level_start", 0) + (
+                self._session_generated_tokens - fix_before
+            )
+            fix_message = fix_result.message or {}
+            fix_reply = str(fix_message.get("content") or "") or str(
+                fix_message.get("reasoning_content") or fix_message.get("reasoning") or ""
+            )
+            memory.apply_fixes(level, fix_reply, transitions, check, summary, deadline=deadline)
         summary["seconds"] = round(time.monotonic() - started, 1)
         summary["generated_tokens"] = self._session_generated_tokens - generated_before
         append_transcript("KEEPER REVIEW", json.dumps(summary, default=str))

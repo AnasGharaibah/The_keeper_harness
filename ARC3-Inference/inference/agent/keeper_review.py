@@ -32,8 +32,39 @@ You just completed level {level}. Its moves (border cells ignored):
 {moves}
 {facts}Write:
 (a) "cause": one sentence - what finally completed the level, and which earlier events it needed.
-(b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply. t.action is e.g. 'RIGHT' or 'MOUSE(row=4, col=7)'; t.before_frame / t.after_frame have .ascii (rows of colour letters), .segmentation, .level, .step; t.result has level_completed, game_over, board_changed. Helpers: cell(frame, row, col), changed_cells(a, b) -> [(row, col, old, new)], parse_action(text) -> (name, row, col). Imports: collections, itertools, math, re, json, functools, statistics. At most 12 lines of code each, no comments.
+(b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply.
+{check_api}
 Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
+
+# The whole check API, with two examples that run as written (tests execute them).
+CHECK_API = """Check API (nothing else exists; no harness tools like frame_diff):
+- t.action: 'RIGHT', 'SPACE' or 'MOUSE(row=4, col=7)'. parse_action(t.action) -> (name, row, col); row and col are None for keys.
+- t.before_frame, t.after_frame: .ascii (rows joined by newlines, one colour letter per cell: W w g G c B M P R b S Y O r N p), .level, .step, .segmentation.
+- t.result: dict with level_completed, game_over, board_changed.
+- cell(frame, row, col) -> colour letter or None. changed_cells(before, after) -> list of (row, col, old, new): four values per item.
+- Import what you use (collections, itertools, math, re, json, functools, statistics). At most 12 lines, no comments.
+Example rule, "RIGHT moves the pink piece one column right":
+def check_transition(t):
+    if parse_action(t.action)[0] != 'RIGHT' or t.result.get('level_completed'):
+        return None
+    def cols(frame):
+        return [c for line in frame.ascii.split('\\n') for c, ch in enumerate(line) if ch == 'P']
+    before, after = cols(t.before_frame), cols(t.after_frame)
+    if not before or not after:
+        return None
+    return min(after) == min(before) + 1
+Example goal, "clicking a cell that is not blue changes nothing":
+def check_transition(t):
+    name, row, col = parse_action(t.action)
+    if name != 'MOUSE' or cell(t.before_frame, row, col) == 'b':
+        return None
+    return not changed_cells(t.before_frame, t.after_frame)"""
+
+FIX_TEMPLATE = """KEEPER CHECK FIX (a harness request: do not call tools, reply with one JSON object only).
+These checks from your review raised an error when run on the level's moves:
+{errors}
+{check_api}
+Reply with fixed code for the same claims: {{"fixes": [{{"id": "K1", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
 
 
 @dataclass
@@ -112,6 +143,26 @@ def parse_reply(text: str) -> dict[str, Any]:
     }
 
 
+def parse_fixes(text: str) -> list[dict[str, str]]:
+    """[{"id", "check_code"}] from a fix reply; a cut-off reply keeps every complete item."""
+    raw = str(text or "")
+    start, end = raw.find("{"), raw.rfind("}")
+    data: Any = None
+    if 0 <= start < end:
+        try:
+            data = json.loads(raw[start : end + 1])
+        except ValueError:
+            data = None
+    items = data.get("fixes") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        items = _salvage_objects(raw[start:]) if start >= 0 else []
+    out = []
+    for item in items:
+        if isinstance(item, dict) and str(item.get("id") or "").strip() and str(item.get("check_code") or "").strip():
+            out.append({"id": str(item["id"]).strip(), "check_code": str(item["check_code"]).strip()})
+    return out
+
+
 # ----- move summary for the request ---------------------------------------------------------
 
 
@@ -185,7 +236,51 @@ class KeeperMemory:
             moves="\n".join(move_lines(transitions, border=border, max_lines=max_moves, color_chars=color_chars)),
             facts=facts_text,
             max_hypotheses=self.max_hypotheses,
+            check_api=CHECK_API,
         )
+
+    # ----- one retry for checks that crashed --------------------------------------------------
+
+    def crashed(self, summary: dict[str, Any]) -> list[Hypothesis]:
+        """Hypotheses this review dropped because their check raised an error."""
+        ids = set(summary.get("dropped") or [])
+        return [h for h in self.hypotheses if h.id in ids and h.status == DROPPED and h.reason.startswith("check could not run")]
+
+    def fix_request_text(self, hypotheses: list[Hypothesis]) -> str:
+        errors = "\n".join(
+            f"- {h.id}: {h.text}\n  error: {h.reason[len('check could not run: '):]}\n  code:\n"
+            + "\n".join("    " + line for line in h.check_code.splitlines())
+            for h in hypotheses
+        )
+        return FIX_TEMPLATE.format(errors=errors, check_api=CHECK_API)
+
+    def apply_fixes(
+        self, level: int, reply_text: str, transitions: list[dict[str, Any]], run_check: CheckRunner,
+        summary: dict[str, Any], *, deadline: float | None = None,
+    ) -> None:
+        """Re-run each crashed hypothesis once with the reviewer's fixed code; one
+        that still cannot run stays dropped."""
+        targets = {h.id: h for h in self.crashed(summary)}
+        summary["retried"] = sorted(targets)
+        summary["fixed"] = []
+        for item in parse_fixes(reply_text):
+            h = targets.pop(item["id"], None)
+            if h is None:
+                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                summary["skipped_checks"] += 1
+                continue
+            summary["dropped"].remove(h.id)
+            h.check_code, h.status, h.reason = item["check_code"], OPEN, ""
+            self._decide(h, level, transitions, run_check, summary)
+            if h.status == DROPPED:
+                h.reason = h.reason.replace("check could not run", "check could not run after a retry", 1)
+            else:
+                summary["fixed"].append(h.id)
+        for h in targets.values():
+            h.reason = h.reason.replace("check could not run", "check could not run (no fix given)", 1)
+        self._enforce_open_cap(summary)
+        self.save()
 
     def apply(
         self,

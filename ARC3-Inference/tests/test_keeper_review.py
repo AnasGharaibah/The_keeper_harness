@@ -212,3 +212,83 @@ def test_notes_block_is_not_repeated_when_messages_carry_images(tmp_path, monkey
         {"role": "user", "content": [{"type": "text", "text": opener}, {"type": "image_url", "image_url": {"url": "data:"}}]}
     )
     assert agent._keeper_before_turn(state_path, "NEXT", lambda *a: None, 900.0) == "NEXT"
+
+
+# ----- check API examples and the one retry ---------------------------------------------------
+
+
+def _examples():
+    text = keeper_review.CHECK_API
+    blocks = text.split("def check_transition(t):")[1:]
+    return ["def check_transition(t):" + b.split("\nExample")[0] for b in blocks]
+
+
+def test_the_prompt_examples_run_as_written():
+    rule, goal = _examples()
+    assert "frame_diff" in keeper_review.CHECK_API and "four values" in keeper_review.CHECK_API
+    report = _check(rule, _transitions()[:3], True)  # player colour 7 is 'P'; RIGHT moves it one column
+    assert report["status"] == "pass" and report["support"] == 3 and report["falsifiable"] is True
+    still = board(4, step=0)
+    lit = board(4, step=1, extra={(6, 8): 9})
+    clicks = [{"action": "MOUSE(row=2, col=2)", "before": still, "after": still, "step": 1, "level": 1, "result": {}},
+              {"action": "MOUSE(row=3, col=3)", "before": still, "after": lit, "step": 2, "level": 1, "result": {}}]
+    assert _check(goal, clicks[:1], False)["status"] == "pass"
+    assert _check(goal, clicks, False)["status"] == "fail"
+
+
+def _scripted_completion(replies, calls):
+    def chat_completion(self, messages, *, tools, request_timeout_seconds=None, max_tokens=None, enable_thinking=None):
+        calls.append({"messages": messages, "max_tokens": max_tokens, "enable_thinking": enable_thinking})
+        return _FakeResult(message={"content": replies[len(calls) - 1]}, usage={"completion_tokens": 100, "prompt_tokens": 9000})
+    return chat_completion
+
+
+def _review_with(tmp_path, monkeypatch, replies):
+    from inference.agent.tool_agent import ToolAgent
+
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    calls = []
+    monkeypatch.setattr(ToolAgent, "_chat_completion", _scripted_completion(replies, calls))
+    agent, state_path, game = make_agent(tmp_path)
+    game.complete_at_col = 8
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    transcript = []
+    agent._keeper_before_turn(state_path, "P", lambda label, text: transcript.append((label, text)), 900.0)
+    return agent, calls, json.loads(transcript[-1][1])
+
+
+BROKEN = "def check_transition(t):\n    return t.level > 0\n"
+
+
+def test_a_crashed_check_is_re_asked_once_with_its_error_and_then_judged(tmp_path, monkeypatch):
+    first = _reply("cause", [{"text": "RIGHT moves the player one column", "kind": "rule", "check_code": BROKEN}])
+    fix = json.dumps({"fixes": [{"id": "K1", "check_code": RIGHT_MOVES_PLAYER}]})
+    agent, calls, summary = _review_with(tmp_path, monkeypatch, [first, fix])
+    assert len(calls) == 2
+    ask = calls[1]["messages"]
+    assert ask[-2] == {"role": "assistant", "content": first}  # same conversation, cached prefix
+    assert ask[-1]["content"].startswith("KEEPER CHECK FIX") and "'TransitionView' object has no attribute 'level'" in ask[-1]["content"]
+    assert calls[1]["enable_thinking"] is False
+    (h,) = agent._keeper_memory.hypotheses
+    assert h.status in ("open", "fact") and h.check_code == RIGHT_MOVES_PLAYER.strip() and h.support > 0
+    assert summary["retried"] == ["K1"] and summary["fixed"] == ["K1"] and summary["dropped"] == []
+    # both requests are review tokens: in the session total, not the level's priority tokens
+    assert agent._session_generated_tokens - agent._tokens_at_level_start == 0
+
+
+def test_a_check_that_still_crashes_is_dropped_and_no_third_request_is_made(tmp_path, monkeypatch):
+    first = _reply("cause", [{"text": "a", "kind": "rule", "check_code": BROKEN},
+                             {"text": "b", "kind": "rule", "check_code": BROKEN.replace("level", "lvl")}])
+    fix = json.dumps({"fixes": [{"id": "K1", "check_code": BROKEN}]})  # K2 gets no fix
+    agent, calls, summary = _review_with(tmp_path, monkeypatch, [first, fix])
+    assert len(calls) == 2
+    reasons = {h.id: (h.status, h.reason) for h in agent._keeper_memory.hypotheses}
+    assert reasons["K1"][0] == "dropped" and reasons["K1"][1].startswith("check could not run after a retry")
+    assert reasons["K2"][0] == "dropped" and reasons["K2"][1].startswith("check could not run (no fix given)")
+    assert summary["fixed"] == [] and sorted(summary["dropped"]) == ["K1", "K2"]
+
+
+def test_no_retry_request_when_every_check_runs(tmp_path, monkeypatch):
+    first = _reply("cause", [{"text": "RIGHT moves", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}])
+    _agent, calls, summary = _review_with(tmp_path, monkeypatch, [first])
+    assert len(calls) == 1 and "retried" not in summary
