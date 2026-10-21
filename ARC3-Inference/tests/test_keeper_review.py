@@ -75,7 +75,8 @@ def test_only_passing_falsifiable_checks_with_support_become_facts():
     assert statuses["broken"][0] == "dropped"
     block = memory.notes_block()
     assert block.startswith("KEEPER NOTES") and "Level 1, likely cause: RIGHT moves the player" in block
-    assert "- RIGHT moves the player one column until the wall (support 4, levels 1)" in block
+    assert "- held on level 1: RIGHT moves the player one column until the wall (support 4)" in block
+    assert "Verified facts" not in block  # facts are shown as level-scoped, not as general rules
     assert "anything holds" not in block  # unfalsifiable ideas are not shown
 
 
@@ -92,6 +93,15 @@ def test_open_hypotheses_carry_to_the_next_level_and_facts_get_demoted():
     bad[0]["after"] = board(8, step=1)  # RIGHT jumped two columns
     summary = memory.apply(3, _reply("c3", []), bad, _check)
     assert hypothesis.status == "refuted" and summary["demoted"] == [hypothesis.id]
+
+
+def test_a_fact_names_every_level_it_held_on():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    memory.apply(1, _reply("c", [{"text": "RIGHT moves the player", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}]),
+                 _transitions(), _check)
+    memory.apply(2, _reply("c2", []), _transitions(), _check)
+    assert memory.hypotheses[0].status == "fact"
+    assert "- held on levels 1 and 2: RIGHT moves the player (support 8)" in memory.notes_block()
 
 
 def test_request_is_short_and_names_the_level():

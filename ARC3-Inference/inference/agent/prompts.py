@@ -235,7 +235,8 @@ KEEPER_SURPRISE_ADDENDUM = (
 
 KEEPER_REVIEW_ADDENDUM = (
     "- After you complete a level, the next message may start with KEEPER NOTES: facts the harness "
-    "verified against your recorded moves, and unverified ideas from a short review of that level.\n"
+    "verified against your recorded moves, each with the levels it held on (a new level can break it), "
+    "and unverified ideas from a short review of that level.\n"
 )
 
 KEEPER_PERCEPTION_ADDENDUM = (

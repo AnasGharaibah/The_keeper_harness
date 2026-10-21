@@ -214,6 +214,13 @@ def move_lines(transitions: list[dict[str, Any]], *, border: int, max_lines: int
 # ----- memory ----------------------------------------------------------------------------------
 
 
+def _held_on(levels: list[int]) -> str:
+    levels = sorted(set(levels))
+    if len(levels) == 1:
+        return f"held on level {levels[0]}"
+    return f"held on levels {', '.join(map(str, levels[:-1]))} and {levels[-1]}"
+
+
 class KeeperMemory:
     def __init__(self, *, min_support: int, max_open: int, max_hypotheses: int, path: Path | None = None) -> None:
         self.min_support = max(1, int(min_support))
@@ -376,8 +383,8 @@ class KeeperMemory:
         )[:3]
         lines = [f"{NOTES_HEADER} (facts are checked by the harness against your recorded moves; the rest is not verified)"]
         if facts:
-            lines.append("Verified facts:")
-            lines += [f"- {h.text} (support {h.support}, levels {','.join(map(str, h.levels_held))})" for h in facts]
+            lines.append("Verified on your recorded moves (each held on the levels named; a new level can break it):")
+            lines += [f"- {_held_on(h.levels_held)}: {h.text} (support {h.support})" for h in facts]
         cause = self.causes.get(self.last_level)
         if cause:
             lines.append(f"Level {self.last_level}, likely cause: {cause}")
