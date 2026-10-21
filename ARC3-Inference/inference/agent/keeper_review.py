@@ -103,6 +103,21 @@ def _salvage_objects(raw: str) -> list[dict[str, Any]]:
     return found
 
 
+CAUSE_MAX_CHARS = 600
+
+
+def clip_at_sentence(text: str, limit: int) -> str:
+    """``text`` if it fits; otherwise cut after the last sentence that ends within
+    ``limit``, or at the last whole word with " ..." when no sentence ends there."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    ends = [m.end() for m in re.finditer(r"[.!?;](?=\s|$)", head)]
+    if ends and ends[-1] >= limit // 3:
+        return head[: ends[-1]].rstrip()
+    return head[: limit - 4].rsplit(" ", 1)[0].rstrip(" ,;:") + " ..."
+
+
 def parse_reply(text: str) -> dict[str, Any]:
     """{"cause", "hypotheses": [{text, kind, check_code}], "truncated"}; a reply cut
     off by the token limit keeps its cause and every complete hypothesis."""
@@ -137,7 +152,7 @@ def parse_reply(text: str) -> dict[str, Any]:
         kind = str(item.get("kind") or "rule").strip().lower()
         hypotheses.append({"text": claim[:300], "kind": kind if kind in ("rule", "goal") else "rule", "check_code": code})
     return {
-        "cause": " ".join(str(data.get("cause") or "").split())[:300],
+        "cause": clip_at_sentence(" ".join(str(data.get("cause") or "").split()), CAUSE_MAX_CHARS),
         "hypotheses": hypotheses,
         "truncated": bool(truncated and start >= 0),
     }
@@ -371,7 +386,7 @@ class KeeperMemory:
             h.status, h.reason = DROPPED, f"more than {self.max_open} open hypotheses"
             summary["dropped"].append(h.id)
 
-    def notes_block(self, *, max_chars: int = 1500) -> str:
+    def notes_block(self, *, max_chars: int = 2000) -> str:
         """The block added to the next level's opening message. Empty when there
         is nothing verified and no reviewed level yet."""
         if self.last_level is None:
@@ -386,8 +401,13 @@ class KeeperMemory:
             lines.append(f"Level {self.last_level}, likely cause: {cause}")
         if len(lines) == 1:
             return ""
-        block = "\n".join(lines)
-        return block if len(block) <= max_chars else block[: max_chars - 4].rstrip() + " ..."
+        # Over the limit: leave out the lowest-support facts rather than cutting text.
+        while len("\n".join(lines)) > max_chars and facts:
+            lines.remove(next(line for line in reversed(lines) if line.startswith("- ")))
+            facts.pop()
+            if not facts and lines[1].startswith("Verified"):
+                lines.pop(1)
+        return "\n".join(lines)
 
     def save(self) -> None:
         if self.path is None:

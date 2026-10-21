@@ -59,6 +59,29 @@ def test_truncated_reply_keeps_cause_and_complete_hypotheses():
     assert [h["text"] for h in parsed["hypotheses"]] == ["a"]
 
 
+def test_a_long_cause_is_cut_at_a_sentence_end_not_mid_word():
+    first = "The level completed when the dot landed on the cross at (31,52). " * 4
+    second = "That needed the yellow bar shortened first so the chain could rise above the purple wall and slide right"
+    parsed = keeper_review.parse_reply(_reply(first + second * 5, []))
+    assert parsed["cause"] == first.strip()
+    assert len(keeper_review.parse_reply(_reply("x" * 300 + ". done", []))["cause"]) == 306  # fits: kept whole
+    words = keeper_review.clip_at_sentence("word " * 200, 600)
+    assert words.endswith("word ...") and len(words) <= 600
+
+
+def test_the_notes_drop_low_support_facts_instead_of_cutting_text():
+    memory = keeper_review.KeeperMemory(min_support=1, max_open=10, max_hypotheses=5)
+    memory.last_level = 1
+    memory.causes[1] = "c" * 590 + "."
+    for i in range(8):
+        memory.hypotheses.append(keeper_review.Hypothesis(id=f"K{i}", text=f"fact {i} " + "x" * 200, kind="rule",
+                                                          check_code="", level_proposed=1, status="fact",
+                                                          support=10 - i, levels_held=[1]))
+    block = memory.notes_block(max_chars=1500)
+    assert len(block) <= 1500 and block.endswith("c" * 590 + ".")
+    assert "fact 0 " in block and "fact 7 " not in block
+
+
 def test_only_passing_falsifiable_checks_with_support_become_facts():
     memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
     reply = _reply("RIGHT moves the player", [
