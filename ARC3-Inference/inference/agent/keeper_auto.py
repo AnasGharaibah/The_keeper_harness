@@ -250,20 +250,23 @@ def surprise_lines(
     border: int,
     max_lines: int,
     color_chars: str = "",
+    effect_cache: dict[int, dict[str, Any]] | None = None,
 ) -> list[str]:
     """SURPRISE lines for the transitions whose step is in ``new_steps`` (the
-    actions of one tool call), first line of each distinct kind, capped."""
+    actions of one tool call), first line of each distinct kind, capped.
+    ``effect_cache`` (step -> effect) persists effects across calls."""
     if not transitions or not new_steps:
         return []
     height = len(transitions[0]["before"])
     width = len(transitions[0]["before"][0]) if height else 0
     mask = border_mask(height, width, border)
-    cache: dict[int, dict[str, Any]] = {}
+    cache: dict[int, dict[str, Any]] = effect_cache if effect_cache is not None else {}
 
     def effect_at(index: int) -> dict[str, Any]:
-        if index not in cache:
-            cache[index] = effect(transitions[index], mask, color_chars)
-        return cache[index]
+        step = transitions[index]["step"]
+        if step not in cache:
+            cache[step] = effect(transitions[index], mask, color_chars)
+        return cache[step]
 
     wanted = set(new_steps)
     total = len(new_steps)

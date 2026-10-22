@@ -70,7 +70,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent import keeper_auto, keeper_perception, keeper_review, keeper_timing
+from inference.agent import keeper_auto, keeper_history, keeper_perception, keeper_review, keeper_timing
 from inference.agent.keeper_check_sandbox import run_check as keeper_run_check
 from inference.agent.keeper_config import KeeperConfig
 from inference.utils.grid_utils import ARC_COLOR_CHARS
@@ -5533,11 +5533,12 @@ class ToolAgent:
         keeper = self._keeper
         started = time.monotonic()
         deadline = started + keeper.review_time_budget_seconds
-        _frame, history = load_runtime_state(state_path)
-        transitions = keeper_auto.level_transitions(history, level)
-        for item in transitions:
-            item["level"] = level
-            item["result"]["board_changed"] = item["before"] != item["after"]
+        # Keeper's own record, not a reload of the runtime-state file; copies,
+        # so the stored transitions stay unchanged.
+        transitions = [
+            {**item, "level": level, "result": {**item["result"], "board_changed": item["before"] != item["after"]}}
+            for item in self._keeper_history_for(state_path).transitions(level)
+        ]
         if not transitions:
             return
         request = memory.request_text(
@@ -5613,61 +5614,73 @@ class ToolAgent:
         summary["generated_tokens"] = self._session_generated_tokens - generated_before
         append_transcript("KEEPER REVIEW", json.dumps(summary, default=str))
 
-    def _keeper_observe(self, state_path: Path, start_frame: Frame | None, payload: dict[str, Any]) -> None:
-        """Keeper: add SURPRISE and perception lines for the actions this tool call executed.
-        Only called when a Keeper observation switch is on. Never raises."""
+    def _keeper_history_for(self, state_path: Path) -> keeper_history.KeeperHistory:
+        history = getattr(self, "_keeper_history", None)
+        if history is None or getattr(self, "_keeper_history_path", None) != state_path:
+            history = keeper_history.KeeperHistory(max_per_level=self._keeper.history_max_per_level)
+            self._keeper_history = history
+            self._keeper_history_path = state_path
+        return history
+
+    def _keeper_after_actions(
+        self, state_path: Path, history: Any, action_results: list[dict[str, Any]], current_frame: Frame | None,
+    ) -> tuple[list[str], list[str]]:
+        """Keeper after a tool call that executed actions: add the new frames to
+        the Keeper's own history (taken from the history the harness already
+        loaded; the runtime-state file is never reloaded here), then SURPRISE and
+        perception lines."""
         keeper = self._keeper
-        try:
-            _frame, history = load_runtime_state(state_path)
-            start_step = start_frame.step if start_frame is not None else -1
-            new_steps = [
-                entry.frame.step
-                for entry in history
-                if entry.frame is not None
-                and entry.frame.step > start_step
-                and not keeper_auto.action_key(entry.action).startswith("RESET")
-            ]
-            if not new_steps:
-                return
-            levels = sorted(
-                {
-                    history[index - 1].frame.level
-                    for index in range(1, len(history))
-                    if history[index].frame is not None
-                    and history[index].frame.step in set(new_steps)
-                    and history[index - 1].frame is not None
-                }
-            )
-            if keeper.surprise:
-                lines: list[str] = []
-                for level in levels:
-                    transitions = keeper_auto.level_transitions(history, level)
-                    lines += keeper_auto.surprise_lines(
-                        transitions,
-                        [t["step"] for t in transitions if t["step"] in set(new_steps)],
-                        border=keeper.border,
-                        max_lines=keeper.surprise_max_lines - len(lines),
-                        color_chars=ARC_COLOR_CHARS,
-                    ) if len(lines) < keeper.surprise_max_lines else []
-                if lines:
-                    payload["surprises"] = lines
-            if keeper.perception:
-                tracker = getattr(self, "_keeper_perception", None)
-                if tracker is None or getattr(self, "_keeper_perception_dir", None) != state_path.parent:
-                    tracker = keeper_perception.PerceptionTracker(
-                        min_size=keeper.perception_min_size, max_lines=keeper.perception_max_lines
-                    )
-                    self._keeper_perception = tracker
-                    self._keeper_perception_dir = state_path.parent
-                perceived: list[str] = []
-                for level in levels:
-                    for transition in keeper_auto.level_transitions(history, level):
-                        if transition["step"] in set(new_steps):
-                            perceived += tracker.observe(transition, set(), level=level)
-                if perceived:
-                    payload["perceived"] = perceived[: keeper.perception_max_lines]
-        except Exception as exc:  # noqa: BLE001 - an observation must never break a tool call
-            log.warning("keeper observation failed: %s", exc)
+        record = self._keeper_history_for(state_path)
+        new_steps = record.sync(history or [])
+        surprises: list[str] = []
+        perceived: list[str] = []
+        if not new_steps:
+            return surprises, perceived
+        levels = record.levels_of(new_steps)
+        wanted = set(new_steps)
+        if keeper.surprise:
+            for level in levels:
+                if len(surprises) >= keeper.surprise_max_lines:
+                    break
+                transitions = record.transitions(level)
+                surprises += keeper_auto.surprise_lines(
+                    transitions,
+                    [t["step"] for t in transitions if t["step"] in wanted],
+                    border=keeper.border,
+                    max_lines=keeper.surprise_max_lines - len(surprises),
+                    color_chars=ARC_COLOR_CHARS,
+                    effect_cache=record.effects,
+                )
+        if keeper.perception:
+            tracker = getattr(self, "_keeper_perception", None)
+            if tracker is None or getattr(self, "_keeper_perception_dir", None) != state_path:
+                tracker = keeper_perception.PerceptionTracker(
+                    min_size=keeper.perception_min_size, max_lines=keeper.perception_max_lines
+                )
+                self._keeper_perception = tracker
+                self._keeper_perception_dir = state_path
+            for level in levels:
+                for transition in record.transitions(level):
+                    if transition["step"] in wanted:
+                        perceived += tracker.observe(transition, set(), level=level)
+            perceived = perceived[: keeper.perception_max_lines]
+        return surprises, perceived
+
+    def _keeper_review_trigger(self, action_results: list[dict[str, Any]], current_frame: Frame | None) -> None:
+        keeper = self._keeper
+        ended = next(
+            (
+                reason
+                for reason in ("level_completed", "game_over")
+                if any(bool(item.get(reason)) for item in action_results)
+            ),
+            None,
+        )
+        if ended == "level_completed" or (ended == "game_over" and keeper.review_on_game_over):
+            self._keeper_pending_review = {
+                "level": current_frame.level if current_frame is not None else 1,
+                "reason": ended,
+            }
 
     def _render_tool_payload(self, payload: dict[str, Any], *, truncate_fields: tuple[str, ...] = ()) -> str:
         result = self._summarize_planned_actions(dict(payload))
@@ -6006,6 +6019,10 @@ class ToolAgent:
 
         current_frame, history_entries = load_runtime_state(state_path)
         valid_actions = list(_normalize_valid_actions(self._current_valid_actions))
+        keeper = getattr(self, "_keeper", None)
+        keeper_watch = keeper is not None and (keeper.any_observation or keeper.review)
+        # Keeper reuses the history this call loads anyway (a reference, not a copy).
+        keeper_seen: list[Any] = [history_entries]
 
         def _serialized_runtime_state(
             *,
@@ -6013,6 +6030,8 @@ class ToolAgent:
             last_action_call_result: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             refreshed_frame, refreshed_history = load_runtime_state(state_path)
+            if keeper_watch:
+                keeper_seen[0] = refreshed_history
             current_frame_payload = _ascii_frame_view_payload(refreshed_frame)
             if isinstance(next_valid_actions, list):
                 sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
@@ -6214,27 +6233,24 @@ class ToolAgent:
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
         keeper = getattr(self, "_keeper", None)
-        if step_executed and keeper is not None and keeper.any_observation:
+        if step_executed and keeper_watch:
+            seen = keeper_seen[0]
             with self._keeper_timing("keeper_seconds"):
-                self._keeper_observe(state_path, current_frame, payload)
+                try:
+                    surprises, perceived = self._keeper_after_actions(state_path, seen, action_results, current_frame)
+                except Exception as exc:  # noqa: BLE001 - an observation must never break a tool call
+                    log.warning("keeper observation failed: %s", exc)
+                    surprises, perceived = [], []
+            if surprises:
+                payload["surprises"] = surprises
+            if perceived:
+                payload["perceived"] = perceived
             timer = getattr(self, "_keeper_timer", None)
             if timer is not None:
                 timer.add_chars("surprises", payload.get("surprises"))
                 timer.add_chars("perceived", payload.get("perceived"))
-        if step_executed and keeper is not None and keeper.review:
-            ended = next(
-                (
-                    reason
-                    for reason in ("level_completed", "game_over")
-                    if any(bool(item.get(reason)) for item in action_results)
-                ),
-                None,
-            )
-            if ended == "level_completed" or (ended == "game_over" and keeper.review_on_game_over):
-                self._keeper_pending_review = {
-                    "level": current_frame.level if current_frame is not None else 1,
-                    "reason": ended,
-                }
+            if keeper.review:
+                self._keeper_review_trigger(action_results, current_frame)
         made_progress = any(
             bool(item.get("gameplay_changed"))
             or bool(item.get("level_completed"))

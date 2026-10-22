@@ -78,7 +78,7 @@ def test_single_object_changes_are_left_to_frame_diff():
 def test_switch_off_adds_nothing(tmp_path, monkeypatch):
     from inference.agent.tool_agent import ToolAgent
 
-    monkeypatch.setattr(ToolAgent, "_keeper_observe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("keeper ran")))
+    monkeypatch.setattr(ToolAgent, "_keeper_after_actions", lambda *a, **k: (_ for _ in ()).throw(AssertionError("keeper ran")))
     agent, state_path, _game = make_agent(tmp_path)
     assert "`perceived`" not in agent._system_prompt
     assert "perceived" not in run_code(agent, state_path, "action(['RIGHT'] * 3)")

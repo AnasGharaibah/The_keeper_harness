@@ -81,7 +81,7 @@ def test_resets_are_skipped_and_kinds_are_deduplicated_and_capped():
 def test_switch_off_adds_no_prompt_text_no_output_and_runs_no_keeper_code(tmp_path, monkeypatch):
     from inference.agent.tool_agent import ToolAgent, _build_system_prompt
 
-    monkeypatch.setattr(ToolAgent, "_keeper_observe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("keeper ran")))
+    monkeypatch.setattr(ToolAgent, "_keeper_after_actions", lambda *a, **k: (_ for _ in ()).throw(AssertionError("keeper ran")))
     agent, state_path, game = make_agent(tmp_path)
     assert "surprises" not in agent._system_prompt
     assert agent._system_prompt == _build_system_prompt(tool_output_tokens=agent._tool_output_tokens)

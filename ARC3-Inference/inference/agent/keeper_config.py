@@ -70,6 +70,8 @@ class KeeperConfig:
     # streams replies so the first token's arrival (queue + prefill) is measured.
     timing: bool = False
     timing_stream: bool = False
+    # Keeper's own per-game history keeps at most this many transitions per level.
+    history_max_per_level: int = 600
 
     @property
     def any_observation(self) -> bool:
@@ -101,4 +103,5 @@ class KeeperConfig:
             perception_min_size=max(1, _env_int("KEEPER_PERCEPTION_MIN_SIZE", defaults.perception_min_size)),
             timing=_env_bool("KEEPER_TIMING", defaults.timing),
             timing_stream=_env_bool("KEEPER_TIMING_STREAM", defaults.timing_stream),
+            history_max_per_level=max(10, _env_int("KEEPER_HISTORY_MAX_PER_LEVEL", defaults.history_max_per_level)),
         )
