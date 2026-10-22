@@ -352,3 +352,32 @@ def test_the_check_api_has_what_crashed_checks_reached_for():
     # still sandboxed: no os, no open
     assert _check("import os\ndef check_transition(t):\n    return True\n", _transitions(), False)["status"] == "error"
     assert _check("def check_transition(t):\n    return open('/etc/passwd') is None\n", _transitions(), False)["status"] == "error"
+
+
+def test_review_requests_run_inside_the_games_priority_slot(tmp_path, monkeypatch):
+    """The solver acquires a game's slot before play and holds it (solver.py),
+    so every request the game makes, reviews included, counts against the
+    ARC3_MAX_ACTIVE_STREAMS limit. The review must not take or free a slot."""
+    import inference.agent.tool_agent as ta
+
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    gate = ta._PriorityGate(1)
+    gate.acquire(0)  # what the solver does for this game before play
+    monkeypatch.setattr(ta, "_priority_gate", lambda: gate)
+    gate_calls = []
+    for name in ("acquire", "release", "handover"):
+        monkeypatch.setattr(gate, name, lambda *a, _n=name, **k: gate_calls.append(_n))
+    free_during_review = []
+
+    def chat(self, messages, **_k):
+        free_during_review.append(gate._free)
+        return ta._ChatCompletionResult(message={"content": _reply("c", [])}, finish_reason="stop",
+                                        usage={"completion_tokens": 1, "prompt_tokens": 1})
+
+    monkeypatch.setattr(ta.ToolAgent, "_chat_completion", chat)
+    agent, state_path, game = make_agent(tmp_path)
+    game.complete_at_col = 8
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0)
+    assert free_during_review == [0]  # the slot is held by this game while the review runs
+    assert gate_calls == []  # the review neither takes a second slot nor frees this one
