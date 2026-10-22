@@ -72,6 +72,11 @@ class KeeperConfig:
     timing_stream: bool = False
     # Keeper's own per-game history keeps at most this many transitions per level.
     history_max_per_level: int = 600
+    # Fail-safe (keeper_guard): a hook that raises or runs past its limit turns
+    # the Keeper off for that game; memory pressure turns it off for the run.
+    hook_timeout_seconds: float = 10.0
+    max_rss_fraction: float = 0.75
+    min_available_fraction: float = 0.10
 
     @property
     def any_observation(self) -> bool:
@@ -104,4 +109,7 @@ class KeeperConfig:
             timing=_env_bool("KEEPER_TIMING", defaults.timing),
             timing_stream=_env_bool("KEEPER_TIMING_STREAM", defaults.timing_stream),
             history_max_per_level=max(10, _env_int("KEEPER_HISTORY_MAX_PER_LEVEL", defaults.history_max_per_level)),
+            hook_timeout_seconds=max(0.1, _env_float("KEEPER_HOOK_TIMEOUT_SECONDS", defaults.hook_timeout_seconds)),
+            max_rss_fraction=min(1.0, max(0.0, _env_float("KEEPER_MAX_RSS_FRACTION", defaults.max_rss_fraction))),
+            min_available_fraction=min(1.0, max(0.0, _env_float("KEEPER_MIN_AVAILABLE_FRACTION", defaults.min_available_fraction))),
         )
