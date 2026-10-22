@@ -77,6 +77,9 @@ class KeeperConfig:
     hook_timeout_seconds: float = 10.0
     max_rss_fraction: float = 0.75
     min_available_fraction: float = 0.10
+    # Resource log: one line every interval in <artifacts>/keeper_resources.jsonl.
+    resource_log: bool = False
+    resource_log_interval_seconds: float = 60.0
 
     @property
     def any_observation(self) -> bool:
@@ -112,4 +115,6 @@ class KeeperConfig:
             hook_timeout_seconds=max(0.1, _env_float("KEEPER_HOOK_TIMEOUT_SECONDS", defaults.hook_timeout_seconds)),
             max_rss_fraction=min(1.0, max(0.0, _env_float("KEEPER_MAX_RSS_FRACTION", defaults.max_rss_fraction))),
             min_available_fraction=min(1.0, max(0.0, _env_float("KEEPER_MIN_AVAILABLE_FRACTION", defaults.min_available_fraction))),
+            resource_log=_env_bool("KEEPER_RESOURCE_LOG", defaults.resource_log),
+            resource_log_interval_seconds=max(1.0, _env_float("KEEPER_RESOURCE_LOG_INTERVAL_SECONDS", defaults.resource_log_interval_seconds)),
         )

@@ -130,6 +130,7 @@ def clear_keeper_env(monkeypatch) -> None:
     for key in list(os.environ):
         if key.startswith("KEEPER_"):
             monkeypatch.delenv(key)
-    from inference.agent import keeper_guard
+    from inference.agent import keeper_guard, keeper_resources
 
     keeper_guard.GLOBAL.reset()
+    keeper_resources.ResourceLogger.reset()

@@ -70,7 +70,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent import keeper_auto, keeper_guard, keeper_history, keeper_perception, keeper_review, keeper_timing
+from inference.agent import keeper_auto, keeper_guard, keeper_history, keeper_perception, keeper_resources, keeper_review, keeper_timing
 from inference.agent.keeper_check_sandbox import run_check as keeper_run_check
 from inference.agent.keeper_config import KeeperConfig
 from inference.utils.grid_utils import ARC_COLOR_CHARS
@@ -6922,21 +6922,36 @@ class ToolAgent:
         """One analyzer turn. With KEEPER_TIMING on, the turn's timing record is
         written to the run artifacts when it ends (see keeper_timing)."""
         keeper = getattr(self, "_keeper", None)
-        if keeper is None or not keeper.timing:
+        if keeper is None or not (keeper.timing or keeper.resource_log):
             return self._analyze_turn(state_path, action_num, *args, **kwargs)
+        game = state_path.stem
+        resources = None
+        if keeper.resource_log:
+            try:
+                resources = keeper_resources.ResourceLogger.start(
+                    state_path.parent / "keeper_resources.jsonl", interval=float(keeper.resource_log_interval_seconds),
+                    gate_getter=_priority_gate, server_url=str(self._model.base_url or ""),
+                )
+                resources.turn_started(game)
+            except Exception as exc:  # noqa: BLE001 - logging must never break a turn
+                log.warning("keeper resource log unavailable: %s", exc)
+                resources = None
         self._keeper_timer = None
-        try:
-            self._keeper_timer = keeper_timing.TurnTimer(
-                keeper_timing.timing_path(state_path), analysis_step=kwargs.get("analysis_step"), action_num=action_num
-            )
-        except Exception as exc:  # noqa: BLE001 - the log must never break a turn
-            log.warning("keeper timing log unavailable: %s", exc)
+        if keeper.timing:
+            try:
+                self._keeper_timer = keeper_timing.TurnTimer(
+                    keeper_timing.timing_path(state_path), analysis_step=kwargs.get("analysis_step"), action_num=action_num
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("keeper timing log unavailable: %s", exc)
         try:
             return self._analyze_turn(state_path, action_num, *args, **kwargs)
         finally:
             timer, self._keeper_timer = self._keeper_timer, None
             if timer is not None:
                 timer.flush()
+            if resources is not None:
+                resources.turn_ended(game)
 
     def _keeper_timing(self, key: str):
         """Time a block into this turn's timing record; does nothing when timing is off."""
