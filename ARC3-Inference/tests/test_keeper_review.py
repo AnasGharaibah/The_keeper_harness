@@ -173,17 +173,20 @@ def test_switch_off_makes_no_request_and_adds_nothing(tmp_path, monkeypatch):
     assert "KEEPER" not in agent._system_prompt and calls == []
 
 
-def test_level_completion_triggers_one_review_on_the_cached_prefix(tmp_path, monkeypatch):
+def test_level_completion_triggers_one_standalone_review_by_default(tmp_path, monkeypatch):
+    from inference.agent import keeper_review
     from inference.agent.tool_agent import ToolAgent
 
     monkeypatch.setenv("KEEPER_REVIEW", "1")
+    monkeypatch.setenv("KEEPER_SURPRISE", "1")
     calls = []
     reply = _reply("Two RIGHT moves reached column 8, which completes the level.",
                    [{"text": "RIGHT moves the player one column", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}])
     monkeypatch.setattr(ToolAgent, "_chat_completion", _fake_completion(reply, calls))
     agent, state_path, game = make_agent(tmp_path)
     assert "KEEPER NOTES" in agent._system_prompt
-    agent._history_messages = [{"role": "user", "content": "earlier turn"}, {"role": "assistant", "content": "ok"}]
+    agent._history_messages = [{"role": "user", "content": "earlier turn"},
+                                {"role": "assistant", "content": "ok", "reasoning_content": "The exit must be to the right."}]
     game.complete_at_col = 8
     run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
     assert agent._keeper_pending_review == {"level": 1, "reason": "level_completed"}
@@ -191,11 +194,15 @@ def test_level_completion_triggers_one_review_on_the_cached_prefix(tmp_path, mon
     transcript = []
     prompt = agent._keeper_before_turn(state_path, "LEVEL UP PROMPT", lambda label, text: transcript.append((label, text)), 900.0)
     (call,) = calls
-    # Same system prompt, history and tools as a game request; thinking off; not stored.
-    assert call["messages"][0] == {"role": "system", "content": agent._system_prompt}
-    assert call["messages"][1:3] == agent._history_messages
-    assert call["messages"][-1]["content"].startswith("KEEPER LEVEL REVIEW")
-    assert call["tools"] == agent._tools(state_path) and call["enable_thinking"] is False and call["max_tokens"] == 2048
+    # A short request of its own: reviewer prompt + review text, no history, no tools, thinking off.
+    assert call["messages"][0] == {"role": "system", "content": keeper_review.REVIEWER_SYSTEM}
+    assert len(call["messages"]) == 2
+    text = call["messages"][1]["content"]
+    assert text.startswith("KEEPER LEVEL REVIEW: level 1 was just completed.")
+    assert "step 2 RIGHT: level completed" in text and "First board of level 1:" in text
+    assert "row 0: " in text or "rows 0-" in text  # run-length boards
+    assert "The exit must be to the right." in text  # the model's own reasoning excerpt
+    assert call["tools"] is None and call["enable_thinking"] is False and call["max_tokens"] == 2048
     assert len(agent._history_messages) == 2
     # Tokens: in the session total, not the turn budget, not the level's priority tokens.
     assert agent._session_generated_tokens == 300 and agent._turn_generated_tokens == 0
@@ -381,3 +388,47 @@ def test_review_requests_run_inside_the_games_priority_slot(tmp_path, monkeypatc
     agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0)
     assert free_during_review == [0]  # the slot is held by this game while the review runs
     assert gate_calls == []  # the review neither takes a second slot nor frees this one
+
+
+def test_prefix_mode_reuses_the_conversation_with_the_games_own_template_settings(tmp_path, monkeypatch):
+    from inference.agent import keeper_review
+    from inference.agent.tool_agent import ToolAgent
+
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    monkeypatch.setenv("KEEPER_REVIEW_MODE", "prefix")
+    calls = []
+    monkeypatch.setattr(ToolAgent, "_chat_completion", _fake_completion(_reply("c", []), calls))
+    agent, state_path, game = make_agent(tmp_path)
+    agent._history_messages = [{"role": "user", "content": "earlier turn"}, {"role": "assistant", "content": "ok"}]
+    game.complete_at_col = 8
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0)
+    (call,) = calls
+    assert call["messages"][0] == {"role": "system", "content": agent._system_prompt}
+    assert call["messages"][1:3] == agent._history_messages
+    assert call["messages"][-1]["content"].startswith(keeper_review.PREFIX_BRIEF + "KEEPER LEVEL REVIEW")
+    # the game's own tools and template settings: thinking is not switched off
+    assert call["tools"] == agent._tools(state_path) and call["enable_thinking"] is None and call["max_tokens"] == 4096
+
+
+def test_standalone_review_text_has_every_part_and_bounded_size():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    memory.apply(1, _reply("c", [{"text": "RIGHT moves the player one column", "kind": "rule",
+                                  "check_code": RIGHT_MOVES_PLAYER}]), _transitions(), _check)
+    lines = [f"SURPRISE: single RIGHT at step {i} vs the last single RIGHT at step {i - 1}: x" for i in range(2, 30)]
+    text = memory.standalone_text(2, _transitions(), border=4, max_moves=60, surprises=lines, reasoning="r" * 50,
+                                  max_surprises=8)
+    assert text.count("SURPRISE:") == 8 and "step 29" in text  # the most recent ones
+    assert "First board of level 2:" in text and "Board just before the completing move (RIGHT)" in text
+    assert "Your own reasoning just before the level was completed" in text
+    assert "held on level 1: RIGHT moves the player one column" in text or "still unchecked" in text
+    assert "Check API" in text
+    off = memory.standalone_text(2, _transitions(), border=4, max_moves=60, boards="off")
+    assert "First board" not in off and "Your own reasoning" not in off
+
+
+def test_run_length_boards_merge_rows_and_keep_coordinates():
+    grid = [[0] * 6, [0] * 6, [0, 0, 3, 3, 0, 0], [0] * 6]
+    text = keeper_review.board_text(grid, "WwgGcB")
+    assert text.splitlines() == ["rows 0-1: W6", "row 2: W2 G2 W2", "row 3: W6"]
+    assert keeper_review.board_text(grid, "WwgGcB", encoding="raw").splitlines()[2] == "WWGGWW"

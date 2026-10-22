@@ -5565,26 +5565,38 @@ class ToolAgent:
         ]
         if not transitions:
             return
-        request = memory.request_text(
-            level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS
-        )
-        # Same system prompt, history and tools as the game's next request, so
-        # the review continues the cached prefix instead of prefilling a new one.
-        # The exchange is not stored in the game history.
-        messages = [{"role": "system", "content": self._system_prompt}, *self._history_messages,
-                    {"role": "user", "content": request}]
+        # The exchange is never stored in the game history. Two modes:
+        # - standalone (default): a short request of its own (reviewer system prompt,
+        #   move summary, SURPRISE lines, facts, two boards, an excerpt of the model's
+        #   reasoning), thinking off. A few thousand tokens; the game's cache is untouched.
+        # - prefix: the game's conversation plus the request, with the game's own
+        #   tools and chat-template settings (thinking stays on), so the cached prompt
+        #   is reused. Sending the conversation with thinking off instead diverges from
+        #   the cache at the first line of the system message (the template adds a
+        #   reasoning-effort line only when thinking is on) and re-processes it all.
+        if keeper.review_mode == "prefix":
+            request = keeper_review.PREFIX_BRIEF + memory.request_text(
+                level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS
+            )
+            messages = [{"role": "system", "content": self._system_prompt}, *self._history_messages,
+                        {"role": "user", "content": request}]
+            request_kwargs = {"tools": self._tools(state_path), "max_tokens": keeper.review_prefix_max_tokens,
+                              "enable_thinking": None}
+        else:
+            request = memory.standalone_text(
+                level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS,
+                surprises=(getattr(self, "_keeper_surprise_log", None) or {}).get(level, []),
+                reasoning=self._keeper_recent_reasoning(keeper.review_reasoning_chars),
+                boards=keeper.review_boards, max_surprises=keeper.review_max_surprises,
+            )
+            messages = [{"role": "system", "content": keeper_review.REVIEWER_SYSTEM}, {"role": "user", "content": request}]
+            request_kwargs = {"tools": None, "max_tokens": keeper.review_max_tokens, "enable_thinking": False}
         timeout = float(keeper.review_time_budget_seconds)
         if request_timeout_seconds is not None:
             timeout = min(timeout, float(request_timeout_seconds))
         self._keeper_request_kind = "review"
         try:
-            result = self._chat_completion(
-                messages,
-                tools=self._tools(state_path),
-                max_tokens=keeper.review_max_tokens,
-                enable_thinking=False,
-                request_timeout_seconds=timeout,
-            )
+            result = self._chat_completion(messages, request_timeout_seconds=timeout, **request_kwargs)
         finally:
             self._keeper_request_kind = None
         usage = getattr(result, "usage", None)
@@ -5616,13 +5628,7 @@ class ToolAgent:
             fix_before = self._session_generated_tokens
             self._keeper_request_kind = "review_fix"
             try:
-                fix_result = self._chat_completion(
-                    fix_messages,
-                    tools=self._tools(state_path),
-                    max_tokens=keeper.review_max_tokens,
-                    enable_thinking=False,
-                    request_timeout_seconds=fix_timeout,
-                )
+                fix_result = self._chat_completion(fix_messages, request_timeout_seconds=fix_timeout, **request_kwargs)
             finally:
                 self._keeper_request_kind = None
             self._accumulate_usage_tokens(getattr(fix_result, "usage", None), count_toward_turn=False)
@@ -5672,11 +5678,15 @@ class ToolAgent:
         levels = record.levels_of(new_steps)
         wanted = set(new_steps)
         if keeper.surprise:
+            log_by_level = getattr(self, "_keeper_surprise_log", None)
+            if log_by_level is None or getattr(self, "_keeper_surprise_log_path", None) != state_path:
+                log_by_level = self._keeper_surprise_log = {}
+                self._keeper_surprise_log_path = state_path
             for level in levels:
                 if len(surprises) >= keeper.surprise_max_lines:
                     break
                 transitions = record.transitions(level)
-                surprises += keeper_auto.surprise_lines(
+                found = keeper_auto.surprise_lines(
                     transitions,
                     [t["step"] for t in transitions if t["step"] in wanted],
                     border=keeper.border,
@@ -5684,6 +5694,12 @@ class ToolAgent:
                     color_chars=ARC_COLOR_CHARS,
                     effect_cache=record.effects,
                 )
+                surprises += found
+                # kept per level for the standalone review (the last few only)
+                log_by_level.setdefault(level, []).extend(found)
+                del log_by_level[level][: -4 * keeper.review_max_surprises]
+            for old_level in [lv for lv in log_by_level if lv < max(levels) - 1]:
+                del log_by_level[old_level]
         if keeper.perception:
             tracker = getattr(self, "_keeper_perception", None)
             if tracker is None or getattr(self, "_keeper_perception_dir", None) != state_path:
@@ -5698,6 +5714,28 @@ class ToolAgent:
                         perceived += tracker.observe(transition, set(), level=level)
             perceived = perceived[: keeper.perception_max_lines]
         return surprises, perceived
+
+    def _keeper_recent_reasoning(self, max_chars: int) -> str:
+        """The last ``max_chars`` of the model's reasoning in the game history (the
+        turns that led to the level completion), oldest first."""
+        if max_chars <= 0:
+            return ""
+        key = os.environ.get("ARC3_REASONING_HISTORY_KEY", "reasoning_content") or "reasoning_content"
+        parts: list[str] = []
+        total = 0
+        for message in reversed(self._history_messages):
+            if message.get("role") != "assistant":
+                continue
+            text = message.get(key) or message.get("reasoning_content") or message.get("reasoning")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            text = " ".join(text.split())
+            parts.append(text)
+            total += len(text)
+            if total >= max_chars:
+                break
+        excerpt = " ".join(reversed(parts))
+        return excerpt[-max_chars:]
 
     def _keeper_review_trigger(self, action_results: list[dict[str, Any]], current_frame: Frame | None) -> None:
         keeper = self._keeper

@@ -59,6 +59,13 @@ class KeeperConfig:
     review_max_moves: int = 60
     review_max_open: int = 10
     review_check_timeout_seconds: int = 10
+    # standalone (default): a short request of its own; prefix: the game's
+    # conversation with the game's own chat-template settings (thinking on).
+    review_mode: str = "standalone"
+    review_boards: str = "runs"          # runs | raw | off
+    review_reasoning_chars: int = 1600   # about 400 tokens of the model's own reasoning
+    review_max_surprises: int = 8
+    review_prefix_max_tokens: int = 4096
     facts_min_support: int = 2
     # Perception lines for what frame_diff() does not report: whole-pattern
     # rotations/flips/scale, shape matches between objects, and player roles.
@@ -102,6 +109,15 @@ class KeeperConfig:
             review_tail_fraction=min(1.0, max(0.0, _env_float("KEEPER_REVIEW_TAIL_FRACTION", defaults.review_tail_fraction))),
             review_max_moves=max(5, _env_int("KEEPER_REVIEW_MAX_MOVES", defaults.review_max_moves)),
             review_max_open=max(0, _env_int("KEEPER_REVIEW_MAX_OPEN", defaults.review_max_open)),
+            review_mode=(os.environ.get("KEEPER_REVIEW_MODE", "").strip().lower() or defaults.review_mode)
+            if (os.environ.get("KEEPER_REVIEW_MODE", "").strip().lower() or defaults.review_mode) in ("standalone", "prefix")
+            else defaults.review_mode,
+            review_boards=(os.environ.get("KEEPER_REVIEW_BOARDS", "").strip().lower() or defaults.review_boards)
+            if (os.environ.get("KEEPER_REVIEW_BOARDS", "").strip().lower() or defaults.review_boards) in ("runs", "raw", "off")
+            else defaults.review_boards,
+            review_reasoning_chars=max(0, _env_int("KEEPER_REVIEW_REASONING_CHARS", defaults.review_reasoning_chars)),
+            review_max_surprises=max(0, _env_int("KEEPER_REVIEW_MAX_SURPRISES", defaults.review_max_surprises)),
+            review_prefix_max_tokens=max(256, _env_int("KEEPER_REVIEW_PREFIX_MAX_TOKENS", defaults.review_prefix_max_tokens)),
             review_check_timeout_seconds=max(
                 1, _env_int("KEEPER_REVIEW_CHECK_TIMEOUT_SECONDS", defaults.review_check_timeout_seconds)
             ),

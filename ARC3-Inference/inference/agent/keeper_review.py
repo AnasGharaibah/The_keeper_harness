@@ -12,6 +12,7 @@ demoted.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -35,6 +36,48 @@ You just completed level {level}. Its moves (border cells ignored):
 (b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply.
 {check_api}
 Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
+
+# Standalone review (the default): a short request of its own, not the game's
+# conversation. Re-sending the whole conversation with different chat-template
+# settings made the server re-process it from scratch (about 73k tokens per
+# review); this request is a few thousand tokens and leaves the game's cache alone.
+REVIEWER_SYSTEM = """You review one completed level of a grid puzzle game that you are playing in another conversation. \
+You receive the level's moves, the first and last boards, and an excerpt of your own reasoning from that level. \
+Boards are rows of colour letters: W white, w light gray, g gray, G dark gray, c charcoal, B black, M magenta, P pink, \
+R red, b blue, S sky blue, Y yellow, O orange, r dark red, N green, p purple. Reply with one JSON object only."""
+
+STANDALONE_TEMPLATE = """KEEPER LEVEL REVIEW: level {level} was just completed.
+Moves on this level (border cells ignored):
+{moves}
+{surprises}{facts}{ideas}{boards}{reasoning}Write:
+(a) "cause": one sentence - what finally completed the level, and which earlier events it needed.
+(b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply.
+{check_api}
+Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
+
+# Prefix review (KEEPER_REVIEW_MODE=prefix): the game's conversation plus this
+# request, sent with the game's own chat-template settings so the cached prompt is
+# reused; thinking therefore stays on and is asked to be brief.
+PREFIX_BRIEF = "Think briefly: a few sentences at most. Then reply with the JSON object only.\n"
+
+
+def board_text(grid: Any, color_chars: str, *, encoding: str = "runs") -> str:
+    """A board as text. "runs": each row as colour-letter + run-length pairs
+    ("g12 S7 g3"), identical consecutive rows merged (about a third of the tokens of
+    the raw grid); "raw": one letter per cell."""
+    chars = color_chars or "0123456789abcdef"
+    letter = lambda v: chars[v] if 0 <= v < len(chars) else "?"
+    rows = [[int(v) for v in row] for row in grid]
+    if encoding == "raw":
+        return "\n".join("".join(letter(v) for v in row) for row in rows)
+    lines = [" ".join(f"{letter(v)}{len(list(g))}" for v, g in itertools.groupby(row)) for row in rows]
+    out, start = [], 0
+    for line, group in itertools.groupby(lines):
+        count = len(list(group))
+        out.append(f"row {start}: {line}" if count == 1 else f"rows {start}-{start + count - 1}: {line}")
+        start += count
+    return "\n".join(out)
+
 
 # The whole check API, with two examples that run as written (tests execute them).
 CHECK_API = """Check API (nothing else exists; no harness tools like frame_diff):
@@ -257,6 +300,40 @@ class KeeperMemory:
             level=level,
             moves="\n".join(move_lines(transitions, border=border, max_lines=max_moves, color_chars=color_chars)),
             facts=facts_text,
+            max_hypotheses=self.max_hypotheses,
+            check_api=CHECK_API,
+        )
+
+    def standalone_text(
+        self, level: int, transitions: list[dict[str, Any]], *, border: int, max_moves: int, color_chars: str = "",
+        surprises: list[str] | None = None, reasoning: str = "", boards: str = "runs", max_surprises: int = 8,
+    ) -> str:
+        """The standalone review request: moves, SURPRISE lines, facts and open ideas
+        (so they are not proposed again), the level's first board and the board just
+        before the completing move, and an excerpt of the model's own reasoning."""
+        facts = sorted((h for h in self.hypotheses if h.status == FACT), key=lambda h: -h.support)[:8]
+        ideas = sorted((h for h in self.hypotheses if h.status == OPEN and not h.reason.startswith("unfalsifiable")),
+                       key=lambda h: -h.support)[:5]
+        lines = list(dict.fromkeys(surprises or []))[-max_surprises:]
+        board_block = ""
+        if boards in ("runs", "raw") and transitions:
+            how = ("each row is colour letter + run length; identical consecutive rows merged"
+                   if boards == "runs" else "one colour letter per cell")
+            board_block = (
+                f"Boards ({how}).\nFirst board of level {level}:\n{board_text(transitions[0]['before'], color_chars, encoding=boards)}\n"
+                f"Board just before the completing move ({transitions[-1]['action']}):\n"
+                f"{board_text(transitions[-1]['before'], color_chars, encoding=boards)}\n"
+            )
+        return STANDALONE_TEMPLATE.format(
+            level=level,
+            moves="\n".join(move_lines(transitions, border=border, max_lines=max_moves, color_chars=color_chars)),
+            surprises=("SURPRISE lines seen on this level:\n" + "\n".join(f"- {s}" for s in lines) + "\n") if lines else "",
+            facts=("Already verified facts (do not repeat them):\n"
+                   + "\n".join(f"- {_held_on(h.levels_held)}: {h.text}" for h in facts) + "\n") if facts else "",
+            ideas=("Ideas already proposed and still unchecked (do not repeat them):\n"
+                   + "\n".join(f"- {h.text}" for h in ideas) + "\n") if ideas else "",
+            boards=board_block,
+            reasoning=(f"Your own reasoning just before the level was completed (excerpt):\n{reasoning}\n") if reasoning else "",
             max_hypotheses=self.max_hypotheses,
             check_api=CHECK_API,
         )
