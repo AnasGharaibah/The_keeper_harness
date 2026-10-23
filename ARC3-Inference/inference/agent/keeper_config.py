@@ -59,6 +59,7 @@ class KeeperConfig:
     review_max_moves: int = 60
     review_max_open: int = 10
     review_check_timeout_seconds: int = 10
+    review_check_budget_seconds: float = 300.0  # total check time per game
     # standalone (default): a short request of its own; prefix: the game's
     # conversation with the game's own chat-template settings (thinking on).
     review_mode: str = "standalone"
@@ -118,6 +119,7 @@ class KeeperConfig:
             review_reasoning_chars=max(0, _env_int("KEEPER_REVIEW_REASONING_CHARS", defaults.review_reasoning_chars)),
             review_max_surprises=max(0, _env_int("KEEPER_REVIEW_MAX_SURPRISES", defaults.review_max_surprises)),
             review_prefix_max_tokens=max(256, _env_int("KEEPER_REVIEW_PREFIX_MAX_TOKENS", defaults.review_prefix_max_tokens)),
+            review_check_budget_seconds=max(0.0, _env_float("KEEPER_REVIEW_CHECK_BUDGET_SECONDS", defaults.review_check_budget_seconds)),
             review_check_timeout_seconds=max(
                 1, _env_int("KEEPER_REVIEW_CHECK_TIMEOUT_SECONDS", defaults.review_check_timeout_seconds)
             ),

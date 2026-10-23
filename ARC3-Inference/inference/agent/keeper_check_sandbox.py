@@ -27,6 +27,7 @@ _BOOTSTRAP = textwrap.dedent(
     r"""
     import builtins
     import json
+    import os
     import signal
     import sys
 
@@ -209,6 +210,10 @@ _BOOTSTRAP = textwrap.dedent(
 
 
     def main():
+        try:
+            os.nice(10)  # checks yield the CPU to the game and the model server
+        except (AttributeError, OSError):
+            pass
         request = json.loads(sys.stdin.readline())
         global COLOR_CHARS
         COLOR_CHARS = str(request.get("color_chars") or "")

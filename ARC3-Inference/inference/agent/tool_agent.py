@@ -5613,8 +5613,15 @@ class ToolAgent:
             reply = str(message.get("reasoning_content") or message.get("reasoning") or "")
 
         def check(code: str, items: list[dict[str, Any]], perturb: bool) -> dict[str, Any]:
+            # Per-game budget for check time; past it, checks are not run and the
+            # hypotheses simply stay undecided.
+            spent = float(getattr(memory, "check_seconds", 0.0))
+            if spent >= keeper.review_check_budget_seconds:
+                return {"status": "timeout", "error": "per-game check budget used"}
             with self._keeper_timing("keeper_seconds"):
-                return keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
+                report = keeper_run_check(code, items, perturb=perturb, timeout_seconds=keeper.review_check_timeout_seconds)
+            memory.check_seconds = spent + float(report.get("seconds") or keeper.review_check_timeout_seconds)
+            return report
 
         summary = memory.apply(level, reply, transitions, check, deadline=deadline)
         crashed = memory.crashed(summary)

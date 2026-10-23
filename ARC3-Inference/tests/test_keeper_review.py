@@ -432,3 +432,23 @@ def test_run_length_boards_merge_rows_and_keep_coordinates():
     text = keeper_review.board_text(grid, "WwgGcB")
     assert text.splitlines() == ["rows 0-1: W6", "row 2: W2 G2 W2", "row 3: W6"]
     assert keeper_review.board_text(grid, "WwgGcB", encoding="raw").splitlines()[2] == "WWGGWW"
+
+
+def test_checks_run_at_low_priority_and_stop_at_the_per_game_budget(tmp_path, monkeypatch):
+    import inference.agent.tool_agent as ta
+    from inference.agent import keeper_check_sandbox
+
+    assert "os.nice(10)" in keeper_check_sandbox._BOOTSTRAP
+    assert _check(RIGHT_MOVES_PLAYER, _transitions()[:3], False)["status"] == "pass"  # still runs fine
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    monkeypatch.setenv("KEEPER_REVIEW_CHECK_BUDGET_SECONDS", "0")
+    ran = []
+    monkeypatch.setattr(ta, "keeper_run_check", lambda *a, **k: ran.append(1) or {"status": "pass", "support": 1})
+    monkeypatch.setattr(ta.ToolAgent, "_chat_completion", _fake_completion(_reply("c", [
+        {"text": "RIGHT moves", "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}]), []))
+    agent, state_path, game = make_agent(tmp_path)
+    game.complete_at_col = 8
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0)
+    (h,) = agent._keeper_memory.hypotheses
+    assert ran == [] and h.status == "open"  # budget used: undecided, not dropped
