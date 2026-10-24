@@ -91,3 +91,11 @@ def test_switch_on_reports_roles_in_the_tool_result(tmp_path, monkeypatch):
     payload = run_code(agent, state_path, "action(['RIGHT'] * 4)")
     assert payload["perceived"][0].startswith("ROLES: likely player = pink (P) 2x2 object at (") and "moved with arrows 3/3" in payload["perceived"][0]
     assert "surprises" not in payload  # independent switches
+
+
+def test_a_same_size_shape_match_is_not_reported():
+    tracker = PerceptionTracker(min_size=3, max_lines=3)
+    before = _board(L_SHAPE, single=L_SHAPE)
+    after = _board(L_SHAPE, single=TARGET)  # the single object now matches the 1x TARGET exactly
+    lines = tracker.observe(_t("RIGHT", before, after), set(), level=1)
+    assert not any("MATCHES" in line or "relative to" in line for line in lines if "scale" not in line)

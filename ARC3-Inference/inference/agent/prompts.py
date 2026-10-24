@@ -241,8 +241,8 @@ KEEPER_REVIEW_ADDENDUM = (
 )
 
 KEEPER_PERCEPTION_ADDENDUM = (
-    "- `perceived` in the tool result reports a whole pattern that rotated, flipped or changed scale, "
-    "an object whose shape starts or stops matching another object (up to rotation and scale), "
+    "- `perceived` in the tool result, when present, reports a whole pattern that rotated, flipped or changed scale, "
+    "an object whose shape starts or stops matching a larger or smaller copy of it elsewhere (up to rotation), "
     "and which objects move with the arrow keys.\n"
 )
 

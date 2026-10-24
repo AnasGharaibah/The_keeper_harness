@@ -410,6 +410,12 @@ class PerceptionTracker:
             new = current.get(pair)
             if old and new and old[0] == new[0]:
                 continue
+            # Only pairs at different scales (a small copy of a large shape, like a
+            # legend or a target): same-size matches came up all the time and the
+            # model treated them as noise (F2K validation, sk48 and dc22).
+            members = (new or old)[1:]
+            if members[0].scale == members[1].scale:
+                continue
             # Name the transformed member first; describe it relative to the other one.
             if new:
                 _relation, a, b = new
