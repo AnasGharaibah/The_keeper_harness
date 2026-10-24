@@ -98,4 +98,5 @@ def test_a_same_size_shape_match_is_not_reported():
     before = _board(L_SHAPE, single=L_SHAPE)
     after = _board(L_SHAPE, single=TARGET)  # the single object now matches the 1x TARGET exactly
     lines = tracker.observe(_t("RIGHT", before, after), set(), level=1)
-    assert not any("MATCHES" in line or "relative to" in line for line in lines if "scale" not in line)
+    # the 1x TARGET at (2,2) is the same size as the single object: no line pairs them
+    assert lines and not any("at (2,2)" in line for line in lines)
