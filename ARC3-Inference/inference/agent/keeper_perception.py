@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from inference.agent.keeper_auto import COLOR_NAMES, object_label
 from inference.agent.keeper_auto import components as _components
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 
@@ -177,11 +178,8 @@ class PObject:
         return r0 < r1 + h1 and r1 < r0 + h0 and c0 < c1 + w1 and c1 < c0 + w0
 
     def label(self) -> str:
-        h, w = self.dims
-        where = f"at ({self.top_left[0]},{self.top_left[1]}) {h}x{w}"
-        if self.kind == "pattern":
-            return f"{self.color} pattern {where}"
-        return f"obj {self.hash} ({self.color}) {where}" if self.hash else f"{self.color} object {where}"
+        text = object_label(self.color, self.cells, self.top_left)
+        return text.replace(" object at ", " pattern at ") if self.kind == "pattern" else text
 
 
 def frame_objects(grid: Any, mask: set[Cell], *, min_size: int) -> list[PObject]:
@@ -502,11 +500,14 @@ class PerceptionTracker:
         if state == self._role_state:
             return []
         self._role_state = state
-        moves = ", ".join(
-            f"obj {h} ({self._movers[h].color}) moved with arrows {self._movers[h].consistent}/"
-            f"{self._movers[h].consistent + self._movers[h].inconsistent}"
-            for h in players
-        )
+        now = {o.hash: o for o in after if o.hash in players}
+
+        def mover(h: str) -> str:
+            stats = self._movers[h]
+            name = now[h].label() if h in now else f"{COLOR_NAMES.get(stats.color, 'colour ' + stats.color)} ({stats.color}) object"
+            return f"{name} moved with arrows {stats.consistent}/{stats.consistent + stats.inconsistent}"
+
+        moves = ", ".join(mover(h) for h in players)
         line = f"ROLES: likely player = {moves}"
         if listed:
             line += "; NOT the player (similar size, never moved with arrows): " + ", ".join(o.label() for o in listed)

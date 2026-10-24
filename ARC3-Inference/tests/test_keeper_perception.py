@@ -59,7 +59,7 @@ def test_pattern_rotation_and_match_are_reported_once():
     s0, s1 = _board(L_SHAPE), _board(_rot_cw(L_SHAPE), player_col=15)
     lines = tracker.observe(_t("RIGHT", s0, s1), set(), level=1)
     assert any("now MATCHES" in line and "scale 2:1" in line for line in lines)
-    assert any("pattern at (15,2) 6x6 ROTATED 90° CW" in line for line in lines)
+    assert any("6x6 pattern at (15,2) ROTATED 90° CW" in line for line in lines)
     s2 = _board(_rot_cw(_rot_cw(L_SHAPE)), player_col=16)
     lines = tracker.observe(_t("RIGHT", s1, s2, 2), set(), level=1)
     assert any("no longer matches" in line for line in lines)
@@ -89,5 +89,5 @@ def test_switch_on_reports_roles_in_the_tool_result(tmp_path, monkeypatch):
     agent, state_path, _game = make_agent(tmp_path, start_col=4)
     assert "`perceived`" in agent._system_prompt
     payload = run_code(agent, state_path, "action(['RIGHT'] * 4)")
-    assert payload["perceived"][0].startswith("ROLES: likely player = obj ") and "moved with arrows 3/3" in payload["perceived"][0]
+    assert payload["perceived"][0].startswith("ROLES: likely player = pink (P) 2x2 object at (") and "moved with arrows 3/3" in payload["perceived"][0]
     assert "surprises" not in payload  # independent switches

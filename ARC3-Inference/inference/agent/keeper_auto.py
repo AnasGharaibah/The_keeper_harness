@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from inference.utils.grid_utils import ARC_COLOR_LEGEND
+
 _ORTH = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
 
@@ -48,6 +50,29 @@ def changed_cell_set(before: Any, after: Any) -> set[tuple[int, int]]:
             if a != b:
                 changed.add((r, c))
     return changed
+
+
+def _color_names() -> dict[str, str]:
+    names = {}
+    for part in ARC_COLOR_LEGEND.split(","):
+        letter, _, name = part.strip().partition("=")
+        if letter and name:
+            names[letter] = name
+    return names
+
+
+COLOR_NAMES = _color_names()
+
+
+def object_label(color: str, cells: Any, top_left: tuple[int, int]) -> str:
+    """How every Keeper line names an object: "white (W) 3x3 object at (12,40)"."""
+    rows = [r for r, _ in cells]
+    cols = [c for _, c in cells]
+    h = (max(rows) - min(rows) + 1) if rows else 0
+    w = (max(cols) - min(cols) + 1) if cols else 0
+    name = COLOR_NAMES.get(color)
+    what = f"{name} ({color})" if name else f"colour {color}"
+    return f"{what} {h}x{w} object at ({top_left[0]},{top_left[1]})"
 
 
 def _shape_hash(cells: set[tuple[int, int]], value: int) -> str:
@@ -117,6 +142,8 @@ def effect(transition: dict[str, Any], mask: set[tuple[int, int]], color_chars: 
         return color_chars[value] if 0 <= value < len(color_chars) else str(value)
 
     colors = {n["hash"]: color(n["value"]) for n in [*after_nodes, *before_nodes]}
+    labels_before = {n["hash"]: object_label(color(n["value"]), n["cells"], n["top_left"]) for n in before_nodes}
+    labels_after = {n["hash"]: object_label(color(n["value"]), n["cells"], n["top_left"]) for n in after_nodes}
     moves: dict[str, tuple[int, int]] = {}
     for object_hash, (r0, c0) in before_unique.items():
         if object_hash in after_unique:
@@ -148,6 +175,8 @@ def effect(transition: dict[str, Any], mask: set[tuple[int, int]], color_chars: 
         "level_completed": bool(result.get("level_completed")),
         "game_over": bool(result.get("game_over")),
         "colors": colors,
+        "labels_before": labels_before,
+        "labels_after": labels_after,
     }
 
 
@@ -162,9 +191,14 @@ def is_toggle_back(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     return current["moves"] == {h: (-d[0], -d[1]) for h, d in previous["moves"].items()}
 
 
-def _obj(object_hash: str, colors: dict[str, str]) -> str:
+def _obj(object_hash: str, colors: dict[str, str], *labels: dict[str, str]) -> str:
+    """The first label found for the object (where it is in that frame), else its colour."""
+    for found in labels:
+        if object_hash in found:
+            return found[object_hash]
     color = colors.get(object_hash)
-    return f"obj {object_hash}" + (f" ({color})" if color else "")
+    name = COLOR_NAMES.get(color or "")
+    return f"{name} ({color}) object" if name else (f"colour {color} object" if color else "an object")
 
 
 def _delta(value: tuple[int, int]) -> str:
@@ -174,6 +208,8 @@ def _delta(value: tuple[int, int]) -> str:
 def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) -> list[tuple[tuple[str, str], str]]:
     """(kind, text) pairs; kind = (category, object) so a call shows one line per kind."""
     colors = {**previous["colors"], **current["colors"]}
+    before = current.get("labels_before", {})
+    after = current.get("labels_after", {})
     found: list[tuple[tuple[str, str], str]] = []
     for key in ("level_completed", "game_over"):
         if current[key] and not previous[key]:
@@ -195,20 +231,20 @@ def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) ->
             found.append(
                 (
                     ("moved_differently", object_hash),
-                    f"{_obj(object_hash, colors)} moved by {_delta(delta)} last time, by {_delta(observed)} this time",
+                    f"{_obj(object_hash, colors, before, after)} moved by {_delta(delta)} last time, by {_delta(observed)} this time",
                 )
             )
     for object_hash, observed in current["moves"].items():
         if object_hash in previous["moves"] or object_hash not in previous["present"]:
             continue
         found.append(
-            (("moved_newly", object_hash), f"{_obj(object_hash, colors)} moved by {_delta(observed)} this time; it stayed last time")
+            (("moved_newly", object_hash), f"{_obj(object_hash, colors, before, after)} moved by {_delta(observed)} this time; it stayed last time")
         )
-    for key, verb in (("appeared", "appeared"), ("disappeared", "disappeared")):
+    for key, verb, where in (("appeared", "appeared", (after, before)), ("disappeared", "disappeared", (before, after))):
         new = [h for h in current[key] if h not in previous[key]]
         if new:
             found.append(
-                ((key, ",".join(new[:2])), f"{', '.join(_obj(h, colors) for h in new[:2])} {verb} this time, not last time")
+                ((key, ",".join(new[:2])), f"{', '.join(_obj(h, colors, *where) for h in new[:2])} {verb} this time, not last time")
             )
     return found
 

@@ -102,3 +102,26 @@ def test_switch_on_reports_the_blocked_move_in_the_tool_result(tmp_path, monkeyp
     )
     assert len(payload["surprises"]) <= 3
     assert list(payload)[-1] == "surprises"  # last field: kept by middle truncation
+
+
+def test_surprise_lines_name_objects_by_colour_size_and_place_not_by_hash():
+    import re
+
+    from inference.agent import keeper_auto
+    from inference.utils.grid_utils import ARC_COLOR_CHARS
+
+    def grid(col):
+        rows = [[0] * 16 for _ in range(16)]
+        for r in (6, 7, 8):
+            for c in (col, col + 1, col + 2):
+                rows[r][c] = 9
+        return tuple(tuple(r) for r in rows)
+
+    ts = [
+        {"action": "RIGHT", "before": grid(4), "after": grid(5), "step": 1, "result": {}},
+        {"action": "RIGHT", "before": grid(5), "after": grid(5), "step": 2, "result": {}},
+    ]
+    lines = keeper_auto.surprise_lines(ts, [2], border=4, max_lines=3, color_chars=ARC_COLOR_CHARS)
+    text = " ".join(lines)
+    assert "blue (b) 3x3 object at (6,5)" in text, lines
+    assert not re.search(r"\b[0-9a-f]{16}\b", text)
