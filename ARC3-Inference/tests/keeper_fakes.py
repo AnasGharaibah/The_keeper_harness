@@ -105,7 +105,9 @@ class FakeGame:
         }
 
 
-def make_agent(tmp_path: Path, **game_kwargs: Any):
+def make_agent(tmp_path: Path, *, first_turn_done: bool = True, **game_kwargs: Any):
+    """``first_turn_done``: the game is past its first analyzer turn, so a Keeper
+    failure turns the Keeper off for this game only (before it, for the run)."""
     from inference.agent.tool_agent import ToolAgent
 
     agent = ToolAgent(model="test-model")
@@ -114,6 +116,8 @@ def make_agent(tmp_path: Path, **game_kwargs: Any):
     agent._ensure_session(state_path)
     agent._step_env_callback = game
     agent._current_valid_actions = ["RIGHT", "UP", "MOUSE"]
+    if first_turn_done:
+        agent._keeper_guard_for(state_path).finish_turn()
     return agent, state_path, game
 
 

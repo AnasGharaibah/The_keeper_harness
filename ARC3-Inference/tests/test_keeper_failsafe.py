@@ -219,7 +219,6 @@ def test_an_analyzer_turn_completes_and_keeps_acting_after_a_hook_failure(tmp_pa
     monkeypatch.setattr(ta.ToolAgent, "_post_chat_completion", post)
     monkeypatch.setattr(keeper_auto, "surprise_lines", _boom)
     monkeypatch.setenv("KEEPER_TIMING", "1")
-    monkeypatch.setattr(keeper_resources.ResourceLogger, "start", _boom)  # even a broken resource log
     monkeypatch.setenv("KEEPER_RESOURCE_LOG", "1")
     agent, state_path, game = make_agent(tmp_path)
     for step in range(1, 4):  # one analyzer turn per executed action call
@@ -227,3 +226,31 @@ def test_an_analyzer_turn_completes_and_keeps_acting_after_a_hook_failure(tmp_pa
                       transcript_path=tmp_path / f"t{step}.txt", analysis_step=step, request_timeout_seconds=900.0)
     assert game.sent == ["RIGHT"] * 6 + ["UP"]
     assert agent._keeper_guard.disabled_reason.startswith("surprise/perception: RuntimeError: injected failure")
+
+
+def test_a_broken_resource_log_turns_keeper_off_for_the_run_and_the_turns_still_act(tmp_path, monkeypatch):
+    from inference.agent import tool_agent as ta
+
+    codes = ["action(['RIGHT'] * 3)", "action(['UP'])", None]
+    seen = []
+
+    def post(self, messages, **_k):
+        seen.append(messages)
+        code = codes[min(len(seen) - 1, len(codes) - 1)]
+        message = {"role": "assistant", "content": "", "reasoning_content": "go"}
+        if code:
+            message["tool_calls"] = [{"id": f"c{len(seen)}", "type": "function",
+                                      "function": {"name": "python", "arguments": json.dumps({"code": code})}}]
+        return ta._ChatCompletionResult(message=message, finish_reason="tool_calls" if code else "stop",
+                                        usage={"completion_tokens": 5, "prompt_tokens": 50})
+
+    monkeypatch.setattr(ta.ToolAgent, "_post_chat_completion", post)
+    monkeypatch.setenv("KEEPER_TIMING", "1")
+    monkeypatch.setenv("KEEPER_RESOURCE_LOG", "1")
+    monkeypatch.setattr(keeper_resources.ResourceLogger, "start", _boom)  # Keeper code outside any game hook
+    agent, state_path, game = make_agent(tmp_path)
+    for step in range(1, 3):
+        agent.analyze(state_path, len(game.history) - 1, ["RIGHT", "UP", "MOUSE"], step_env=game,
+                      transcript_path=tmp_path / f"t{step}.txt", analysis_step=step, request_timeout_seconds=900.0)
+    assert game.sent == ["RIGHT"] * 3 + ["UP"]
+    assert keeper_guard.GLOBAL.disabled_reason.startswith("turn start: RuntimeError: injected failure")

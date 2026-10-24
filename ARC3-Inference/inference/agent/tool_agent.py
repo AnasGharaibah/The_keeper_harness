@@ -2657,6 +2657,12 @@ def _render_auto_frame_diff(
     ]
 
 
+def _keeper_config() -> KeeperConfig:
+    """The Keeper switches from the environment; all off once the Keeper has been
+    turned off for the run, or when reading them fails (which turns it off)."""
+    return keeper_guard.outside("config", KeeperConfig.from_env, fallback=None) or KeeperConfig()
+
+
 def _build_system_prompt(*, tool_output_tokens: int) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     # ARC3_SYSTEM_PROMPT_PREFIX (read at call time): prepended verbatim as the
@@ -2721,7 +2727,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         # either way - this only controls whether the model is told about it,
         # so the arm measures whether knowing costs more than it returns.
         prompt += FRAME_DIFF_HINT_ADDENDUM
-    _keeper = KeeperConfig.from_env()
+    _keeper = _keeper_config()
     if _keeper.surprise:
         prompt += KEEPER_SURPRISE_ADDENDUM
     if _keeper.review:
@@ -3474,6 +3480,9 @@ class _ChatCompletionResult:
 # The review bounds its own model requests and checks; past budget + margin the
 # Keeper is turned off for that game.
 _KEEPER_REVIEW_BUDGET_MARGIN_SECONDS = 60.0
+# A review that is still running this long after its budget has hung; it is
+# abandoned so it can never hold the game's priority slot.
+_KEEPER_REVIEW_HARD_MARGIN_SECONDS = 120.0
 
 
 def _note_first_data_line(lines, probe: dict[str, float]):
@@ -3529,11 +3538,11 @@ class ToolAgent:
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
         )
-        self._keeper = KeeperConfig.from_env()
-        keeper_guard.GLOBAL.configure(
+        self._keeper = _keeper_config()
+        keeper_guard.outside("startup", lambda: keeper_guard.GLOBAL.configure(
             max_rss_fraction=self._keeper.max_rss_fraction,
             min_available_fraction=self._keeper.min_available_fraction,
-        )
+        ))
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
@@ -5249,27 +5258,24 @@ class ToolAgent:
 
     def _chat_completion(self, messages: list[dict[str, Any]], **kwargs: Any) -> _ChatCompletionResult:
         timer = getattr(self, "_keeper_timer", None)
-        if timer is None:
+        if timer is None or not keeper_guard.GLOBAL.active:
             return self._post_chat_completion(messages, **kwargs)
-        probe: dict[str, float] | None = {} if self._keeper.timing_stream else None
+        probe: dict[str, float] | None = keeper_guard.outside(
+            "request timing", lambda: {} if self._keeper.timing_stream else None
+        )
         self._keeper_first_token = probe
         kind = getattr(self, "_keeper_request_kind", None) or "turn"
         started = time.monotonic()
         try:
             result = self._post_chat_completion(messages, **kwargs)
         except Exception:
-            try:
-                timer.add_request(f"{kind}_error", time.monotonic() - started, None)
-            except Exception:  # noqa: BLE001 - the log must never change the outcome
-                pass
+            # the log must never change the outcome: the request's own error is re-raised
+            keeper_guard.outside("request timing", lambda: timer.add_request(f"{kind}_error", time.monotonic() - started, None))
             raise
         finally:
             self._keeper_first_token = None
-        try:
-            first = probe["at"] - started if probe and "at" in probe else None
-            timer.add_request(kind, time.monotonic() - started, result.usage, first)
-        except Exception:  # noqa: BLE001
-            pass
+        first = probe["at"] - started if probe and "at" in probe else None
+        keeper_guard.outside("request timing", lambda: timer.add_request(kind, time.monotonic() - started, result.usage, first))
         return result
 
     def _post_chat_completion(
@@ -5496,14 +5502,20 @@ class ToolAgent:
         """Keeper: run a pending post-level review, then return the user prompt with
         the notes block in front of it (on the level-up message, or once more
         after the message carrying it was trimmed away). Never raises: any
-        failure disables the Keeper for this game and the prompt goes out as is."""
+        failure disables the Keeper for this game and the prompt goes out as is.
+        The review bounds itself (``budget``); the hard limit after it only
+        catches a review that hangs, so it can never hold the game's slot."""
         keeper = self._keeper
-        guard = self._keeper_guard_for(state_path)
+        guard = keeper_guard.outside("review/notes", lambda: self._keeper_guard_for(state_path))
+        if guard is None:
+            return user_prompt
+        budget = float(keeper.review_time_budget_seconds) + _KEEPER_REVIEW_BUDGET_MARGIN_SECONDS
         return guard.call(
             "review/notes",
             lambda: self._keeper_before_turn_inner(state_path, user_prompt, append_transcript, request_timeout_seconds),
             fallback=user_prompt,
-            budget=float(keeper.review_time_budget_seconds) + _KEEPER_REVIEW_BUDGET_MARGIN_SECONDS,
+            budget=budget,
+            timeout=float(keeper.review_time_budget_seconds) + _KEEPER_REVIEW_HARD_MARGIN_SECONDS,
         )
 
     def _keeper_before_turn_inner(
@@ -5667,6 +5679,34 @@ class ToolAgent:
             self._keeper_history = history
             self._keeper_history_path = state_path
         return history
+
+    def _keeper_tool_result(
+        self, state_path: Path, history: Any, action_results: list[dict[str, Any]], current_frame: Frame | None,
+    ) -> dict[str, Any]:
+        """The fields the Keeper adds to a tool result that executed actions
+        (``surprises``, ``perceived``), and the review trigger. Called through
+        ``keeper_guard.outside``: an error here turns the Keeper off for the run."""
+        keeper = self._keeper
+        guard = self._keeper_guard_for(state_path)
+        with self._keeper_timing("keeper_seconds"):
+            surprises, perceived = guard.call(
+                "surprise/perception",
+                lambda: self._keeper_after_actions(state_path, history, action_results, current_frame),
+                fallback=([], []),
+                timeout=float(keeper.hook_timeout_seconds),
+            )
+        added: dict[str, Any] = {}
+        if surprises:
+            added["surprises"] = [str(line) for line in surprises]
+        if perceived:
+            added["perceived"] = [str(line) for line in perceived]
+        timer = getattr(self, "_keeper_timer", None)
+        if timer is not None:
+            timer.add_chars("surprises", added.get("surprises"))
+            timer.add_chars("perceived", added.get("perceived"))
+        if keeper.review:
+            guard.call("review trigger", lambda: self._keeper_review_trigger(action_results, current_frame))
+        return added
 
     def _keeper_after_actions(
         self, state_path: Path, history: Any, action_results: list[dict[str, Any]], current_frame: Frame | None,
@@ -6098,7 +6138,9 @@ class ToolAgent:
         current_frame, history_entries = load_runtime_state(state_path)
         valid_actions = list(_normalize_valid_actions(self._current_valid_actions))
         keeper = getattr(self, "_keeper", None)
-        keeper_watch = keeper is not None and (keeper.any_observation or keeper.review)
+        keeper_watch = (
+            keeper is not None and (keeper.any_observation or keeper.review) and keeper_guard.GLOBAL.active
+        )
         # Keeper reuses the history this call loads anyway (a reference, not a copy).
         keeper_seen: list[Any] = [history_entries]
 
@@ -6312,25 +6354,13 @@ class ToolAgent:
         step_executed = any(bool(item.get("executed")) for item in action_results)
         keeper = getattr(self, "_keeper", None)
         if step_executed and keeper_watch:
-            guard = self._keeper_guard_for(state_path)
             seen = keeper_seen[0]
-            with self._keeper_timing("keeper_seconds"):
-                surprises, perceived = guard.call(
-                    "surprise/perception",
-                    lambda: self._keeper_after_actions(state_path, seen, action_results, current_frame),
-                    fallback=([], []),
-                    timeout=float(keeper.hook_timeout_seconds),
-                )
-            if surprises:
-                payload["surprises"] = surprises
-            if perceived:
-                payload["perceived"] = perceived
-            timer = getattr(self, "_keeper_timer", None)
-            if timer is not None:
-                timer.add_chars("surprises", payload.get("surprises"))
-                timer.add_chars("perceived", payload.get("perceived"))
-            if keeper.review:
-                guard.call("review trigger", lambda: self._keeper_review_trigger(action_results, current_frame))
+            added = keeper_guard.outside(
+                "tool result",
+                lambda: self._keeper_tool_result(state_path, seen, action_results, current_frame),
+                fallback={},
+            )
+            payload.update(added or {})
         made_progress = any(
             bool(item.get("gameplay_changed"))
             or bool(item.get("level_completed"))
@@ -6967,41 +6997,55 @@ class ToolAgent:
         """One analyzer turn. With KEEPER_TIMING on, the turn's timing record is
         written to the run artifacts when it ends (see keeper_timing)."""
         keeper = getattr(self, "_keeper", None)
-        if keeper is None or not (keeper.timing or keeper.resource_log):
+        if keeper is None or not keeper.any_switch or not keeper_guard.GLOBAL.active:
             return self._analyze_turn(state_path, action_num, *args, **kwargs)
-        game = state_path.stem
+        resources = keeper_guard.outside(
+            "turn start", lambda: self._keeper_turn_start(state_path, action_num, kwargs.get("analysis_step"))
+        )
+        try:
+            result = self._analyze_turn(state_path, action_num, *args, **kwargs)
+        finally:
+            timer, self._keeper_timer = getattr(self, "_keeper_timer", None), None
+            keeper_guard.outside("turn end", lambda: self._keeper_turn_end(state_path, timer, resources))
+        # only a turn that finished counts: a Keeper failure before this point
+        # turns the Keeper off for the whole run (keeper_guard.GameGuard.disable)
+        keeper_guard.outside("turn end", lambda: self._keeper_guard_for(state_path).finish_turn())
+        return result
+
+    def _keeper_turn_start(self, state_path: Path, action_num: int, analysis_step: Any):
+        """Start this turn's timing record and note the turn in the resource log;
+        returns the resource logger (None when that log is off)."""
+        keeper = self._keeper
+        self._keeper_timer = None
         resources = None
         if keeper.resource_log:
-            try:
-                resources = keeper_resources.ResourceLogger.start(
-                    state_path.parent / "keeper_resources.jsonl", interval=float(keeper.resource_log_interval_seconds),
-                    gate_getter=_priority_gate, server_url=str(self._model.base_url or ""),
-                )
-                resources.turn_started(game)
-            except Exception as exc:  # noqa: BLE001 - logging must never break a turn
-                log.warning("keeper resource log unavailable: %s", exc)
-                resources = None
-        self._keeper_timer = None
+            resources = keeper_resources.ResourceLogger.start(
+                state_path.parent / "keeper_resources.jsonl", interval=float(keeper.resource_log_interval_seconds),
+                gate_getter=_priority_gate, server_url=str(self._model.base_url or ""),
+            )
+            resources.turn_started(state_path.stem)
         if keeper.timing:
-            try:
-                self._keeper_timer = keeper_timing.TurnTimer(
-                    keeper_timing.timing_path(state_path), analysis_step=kwargs.get("analysis_step"), action_num=action_num
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("keeper timing log unavailable: %s", exc)
-        try:
-            return self._analyze_turn(state_path, action_num, *args, **kwargs)
-        finally:
-            timer, self._keeper_timer = self._keeper_timer, None
-            if timer is not None:
-                timer.flush()
-            if resources is not None:
-                resources.turn_ended(game)
+            self._keeper_timer = keeper_timing.TurnTimer(
+                keeper_timing.timing_path(state_path), analysis_step=analysis_step, action_num=action_num
+            )
+        return resources
+
+    def _keeper_turn_end(self, state_path: Path, timer: Any, resources: Any) -> None:
+        if timer is not None:
+            timer.flush()
+        if resources is not None:
+            resources.turn_ended(state_path.stem)
 
     def _keeper_timing(self, key: str):
-        """Time a block into this turn's timing record; does nothing when timing is off."""
+        """Time a block into this turn's timing record; does nothing when timing is
+        off or the Keeper is off for the run. Never raises: a timing failure turns
+        the Keeper off and leaves the timed block's own outcome unchanged."""
         timer = getattr(self, "_keeper_timer", None)
-        return timer.measure(key) if timer is not None else keeper_timing.nothing()
+        if timer is None or not keeper_guard.GLOBAL.active:
+            return keeper_timing.nothing()
+        return keeper_timing.measured(timer, key, on_error=lambda exc: keeper_guard.GLOBAL.disable(
+            f"timing: {exc.__class__.__name__}: {str(exc)[:200]}"
+        ))
 
     def _analyze_turn(
         self,
@@ -7109,10 +7153,15 @@ class ToolAgent:
             self._pending_diff_image = self._turn_diff_image
             self._pending_diff_image_label = self._turn_diff_image_label
         keeper = getattr(self, "_keeper", None)
-        if keeper is not None and keeper.review and not resuming_after_yield:
-            user_prompt = self._keeper_before_turn(
-                state_path, user_prompt, append_transcript, request_timeout_seconds
+        if keeper is not None and keeper.review and not resuming_after_yield and keeper_guard.GLOBAL.active:
+            prompt_in = user_prompt
+            user_prompt = keeper_guard.outside(
+                "review/notes",
+                lambda: self._keeper_before_turn(state_path, prompt_in, append_transcript, request_timeout_seconds),
+                fallback=prompt_in,
             )
+            if not isinstance(user_prompt, str):
+                user_prompt = prompt_in
         if resume_mode == "state_only":
             opening_message = self._build_user_message(
                 _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION,

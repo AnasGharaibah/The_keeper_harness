@@ -10,6 +10,12 @@
   MemTotal; default 0.75), or the system's available RAM falls below
   ``KEEPER_MIN_AVAILABLE_FRACTION`` (default 0.10), all Keeper work stops for
   the rest of the run and its per-game histories are dropped.
+- ``outside``: Keeper code that is not inside a game's hook (startup, config,
+  prompt assembly, the timing and resource logs, the glue around the hooks).
+  Any error there turns the Keeper off for the whole run.
+- Last resort: a game whose Keeper fails before its first turn has finished
+  turns the Keeper off for the whole run, not just for that game; a failure
+  that early points at the setup, which every other game shares.
 """
 from __future__ import annotations
 
@@ -132,11 +138,28 @@ class _Global:
             except Exception:  # noqa: BLE001
                 pass
 
+    @property
+    def active(self) -> bool:
+        return self.disabled_reason is None
+
     def reset(self) -> None:  # tests
         self.__init__()
 
 
 GLOBAL = _Global()
+
+
+def outside(where: str, fn: Callable[[], Any], fallback: Any = None) -> Any:
+    """Run Keeper code that is not inside a game's hook. Any exception turns the
+    Keeper off for the rest of the run and returns ``fallback``; once it is off,
+    ``fn`` is not run at all."""
+    if GLOBAL.disabled_reason is not None:
+        return fallback
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 - MemoryError included
+        GLOBAL.disable(f"{where}: {exc.__class__.__name__}: {str(exc)[:200]}")
+        return fallback
 
 
 # ----- per-game guard ---------------------------------------------------------------------------
@@ -168,6 +191,7 @@ class GameGuard:
     def __init__(self, game: str) -> None:
         self.game = game
         self.disabled_reason: str | None = None
+        self.turns_done = 0  # analyzer turns of this game that have finished
 
     @property
     def active(self) -> bool:
@@ -176,12 +200,17 @@ class GameGuard:
         GLOBAL.check_memory()
         return GLOBAL.disabled_reason is None
 
+    def finish_turn(self) -> None:
+        self.turns_done += 1
+
     def disable(self, hook: str, reason: str) -> None:
         if self.disabled_reason is not None:
             return
         self.disabled_reason = f"{hook}: {reason}"
         GLOBAL.disabled_games.add(self.game)
         log.warning("keeper disabled for %s after %s; the game continues without Keeper", self.game, self.disabled_reason)
+        if self.turns_done == 0:
+            GLOBAL.disable(f"{self.game} failed before its first turn finished ({self.disabled_reason})")
 
     def call(self, hook: str, fn: Callable[[], Any], fallback: Any = None, *, timeout: float | None = None,
              budget: float | None = None) -> Any:

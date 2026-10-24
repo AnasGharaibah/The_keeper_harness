@@ -109,6 +109,21 @@ def nothing():
     yield
 
 
+@contextmanager
+def measured(timer: TurnTimer, key: str, *, on_error):
+    """``timer.measure(key)`` that never raises from the timing itself: the timed
+    block's own exception passes through unchanged, a failure of the timer is
+    handed to ``on_error``."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        try:
+            timer.add(key, time.monotonic() - started)
+        except Exception as exc:  # noqa: BLE001
+            on_error(exc)
+
+
 # ----- offline summary ------------------------------------------------------------------------
 
 

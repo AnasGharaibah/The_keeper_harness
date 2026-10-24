@@ -93,6 +93,10 @@ class KeeperConfig:
     def any_observation(self) -> bool:
         return self.surprise or self.perception
 
+    @property
+    def any_switch(self) -> bool:
+        return self.surprise or self.perception or self.review or self.timing or self.resource_log
+
     @classmethod
     def from_env(cls) -> "KeeperConfig":
         defaults = cls()
