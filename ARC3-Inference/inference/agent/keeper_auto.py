@@ -201,6 +201,10 @@ def _obj(object_hash: str, colors: dict[str, str], *labels: dict[str, str]) -> s
     return f"{name} ({color}) object" if name else (f"colour {color} object" if color else "an object")
 
 
+def _jitter(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1])) <= 1
+
+
 def _delta(value: tuple[int, int]) -> str:
     return f"[{value[0]},{value[1]}]"
 
@@ -211,10 +215,13 @@ def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) ->
     before = current.get("labels_before", {})
     after = current.get("labels_after", {})
     found: list[tuple[tuple[str, str], str]] = []
-    for key in ("level_completed", "game_over"):
-        if current[key] and not previous[key]:
-            found.append(((key, ""), f"it caused {key} this time, not last time"))
-    if current["level_completed"] or current["game_over"]:
+    # A level-completing action: the tool result already says so, and the
+    # board after it is the next level's, so there is nothing to compare.
+    if current["level_completed"]:
+        return found
+    if current["game_over"] and not previous["game_over"]:
+        found.append((("game_over", ""), "it caused game_over this time, not last time"))
+    if current["game_over"]:
         return found
     if is_toggle_back(previous, current):
         return found
@@ -227,6 +234,8 @@ def surprises(action: str, previous: dict[str, Any], current: dict[str, Any]) ->
         if object_hash not in current["present"]:
             continue
         observed = current["moves"].get(object_hash, (0, 0))
+        if observed != (0, 0) and _jitter(delta, observed):
+            continue  # moved both times, one cell apart: animation jitter
         if observed != delta:
             found.append(
                 (

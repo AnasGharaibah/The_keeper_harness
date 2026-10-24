@@ -125,3 +125,37 @@ def test_surprise_lines_name_objects_by_colour_size_and_place_not_by_hash():
     text = " ".join(lines)
     assert "blue (b) 3x3 object at (6,5)" in text, lines
     assert not re.search(r"\b[0-9a-f]{16}\b", text)
+
+
+def _block_grid(r0, c0, size=3, value=9, n=20):
+    rows = [[0] * n for _ in range(n)]
+    for r in range(r0, r0 + size):
+        for c in range(c0, c0 + size):
+            rows[r][c] = value
+    return tuple(tuple(r) for r in rows)
+
+
+def test_no_surprise_line_for_a_level_completing_action():
+    from inference.agent import keeper_auto
+
+    ts = [
+        {"action": "RIGHT", "before": _block_grid(8, 5), "after": _block_grid(8, 6), "step": 1, "result": {}},
+        {"action": "RIGHT", "before": _block_grid(8, 6), "after": _block_grid(8, 6), "step": 2,
+         "result": {"level_completed": True}},
+    ]
+    assert keeper_auto.surprise_lines(ts, [2], border=4, max_lines=3) == []
+
+
+def test_one_cell_animation_jitter_is_not_a_surprise_but_a_block_still_is():
+    from inference.agent import keeper_auto
+
+    jitter = [
+        {"action": "DOWN", "before": _block_grid(5, 6), "after": _block_grid(12, 5), "step": 1, "result": {}},
+        {"action": "DOWN", "before": _block_grid(5, 9), "after": _block_grid(11, 9), "step": 2, "result": {}},
+    ]
+    assert keeper_auto.surprise_lines(jitter, [2], border=4, max_lines=3) == []
+    blocked = [
+        {"action": "DOWN", "before": _block_grid(5, 6), "after": _block_grid(6, 6), "step": 1, "result": {}},
+        {"action": "DOWN", "before": _block_grid(6, 6), "after": _block_grid(6, 6), "step": 2, "result": {}},
+    ]
+    assert keeper_auto.surprise_lines(blocked, [2], border=4, max_lines=3)
