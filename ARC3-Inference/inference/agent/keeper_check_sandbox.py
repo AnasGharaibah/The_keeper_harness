@@ -9,6 +9,7 @@ copies of the transitions, so a check that passes on anything is not a fact.
 """
 from __future__ import annotations
 
+import atexit
 import inspect
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from typing import Any
 
@@ -254,6 +256,32 @@ def _rows(grid: Any) -> list[str]:
     return ["".join(ARC_COLOR_CHARS[max(0, min(15, int(v)))] for v in row) for row in grid]
 
 
+# Check processes still running. Each one is waited for (or killed) by the call
+# that started it; this set only catches a process whose caller was abandoned
+# (a review past its hard limit) when the interpreter exits.
+_LIVE: set[subprocess.Popen] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _kill(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+@atexit.register
+def kill_live_checks() -> None:
+    with _LIVE_LOCK:
+        live = list(_LIVE)
+        _LIVE.clear()
+    for process in live:
+        _kill(process)
+
+
 def run_check(
     check_code: str,
     transitions: list[dict[str, Any]],
@@ -298,16 +326,21 @@ def run_check(
             )
         except OSError:
             return {"status": "error", "error": "check sandbox could not start"}
+        with _LIVE_LOCK:
+            _LIVE.add(process)
         started = time.monotonic()
         try:
             out, _err = process.communicate(json.dumps(payload) + "\n", timeout=max(1, int(timeout_seconds)) + 2)
         except subprocess.TimeoutExpired:
+            _kill(process)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
-            process.communicate()
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             return {"status": "timeout", "error": f"check exceeded {timeout_seconds}s"}
+        finally:
+            with _LIVE_LOCK:
+                _LIVE.discard(process)
         try:
             report = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):

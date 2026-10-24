@@ -19,8 +19,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import threading
 import time
 import weakref
@@ -34,6 +36,23 @@ PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 class KeeperTimeout(Exception):
     pass
+
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def artifact_path(state_path: Path, suffix: str) -> Path:
+    """A Keeper file next to the game's runtime state, named from its stem.
+
+    Hidden games can have any id, and the stem carries it: the Keeper's own
+    files use ASCII letters, digits, ``_ . -`` only, and stay short. A stem that
+    had to be changed or cut gets a hash of the original, so two games never
+    share a file."""
+    stem = state_path.stem
+    safe = _UNSAFE.sub("_", stem).strip(".") or "game"
+    if safe != stem or len(safe) > 120:
+        safe = f"{safe[:80]}_{hashlib.sha1(stem.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
+    return state_path.with_name(f"{safe}{suffix}")
 
 
 # ----- memory readings ------------------------------------------------------------------------

@@ -319,3 +319,60 @@ def test_after_the_switch_the_tool_result_is_the_baseline(tmp_path):
         assert "surprises" not in payload and "perceived" not in payload
     assert agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0) == "P"
     assert getattr(agent, "_keeper_history", None) is None  # no Keeper work at all
+
+
+# ----- Keeper file names from any game id -----------------------------------------------------------
+
+
+def test_keeper_file_names_are_safe_short_and_distinct_for_any_id(tmp_path):
+    names = set()
+    for game_id in ODD_IDS + ["a/b", "ünï", "\udcff"]:
+        state = tmp_path / f"{game_id.replace('/', '_')}_p0_tool_runtime_state.json"
+        path = keeper_guard.artifact_path(state, "_keeper_facts.json")
+        assert path.parent == tmp_path and len(path.name) <= 160
+        assert all(ch.isascii() and (ch.isalnum() or ch in "_.-") for ch in path.name)
+        names.add(path.name)
+        path.write_text("{}")  # the file system accepts it
+    assert len(names) == len(ODD_IDS) + 3
+
+
+def test_public_game_file_names_are_unchanged(tmp_path):
+    state = tmp_path / "lp85-305b61c3_p0_tool_runtime_state.json"
+    assert keeper_guard.artifact_path(state, "_keeper_facts.json").name == "lp85-305b61c3_p0_tool_runtime_state_keeper_facts.json"
+    assert keeper_timing.timing_path(state).name == "lp85-305b61c3_p0_tool_runtime_state_timing.jsonl"
+
+
+@pytest.mark.parametrize("ending", ["game_over", "level_completed", "run_complete"])
+def test_a_game_that_ends_on_its_first_action(tmp_path, monkeypatch, ending):
+    import inference.agent.tool_agent as ta
+
+    monkeypatch.setattr(ta.ToolAgent, "_chat_completion", lambda self, m, **k: ta._ChatCompletionResult(
+        message={"content": "{}"}, finish_reason="stop", usage={}))
+    rng = random.Random(7)
+    agent, state_path, game = _agent(tmp_path, "end1", ["UP"], rng, odd_values=False, shape_changes=False)
+    real = game.__call__
+
+    def first_action_ends(arguments):
+        out = real(arguments)
+        out[ending] = True
+        if out["per_action"]:
+            out["per_action"][-1][ending] = True
+        game.history[-1].result[ending] = True
+        return out
+
+    agent._step_env_callback = first_action_ends
+    payload = run_code(agent, state_path, "action(['UP'])")
+    assert isinstance(payload, dict) and game.sent == ["UP"]
+    assert agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0).endswith("P")
+    assert keeper_guard.GLOBAL.disabled_reason is None
+
+
+def test_a_reset_before_any_move(tmp_path):
+    rng = random.Random(8)
+    grid = _grid(rng, (64, 64), odd_values=False)
+    record = keeper_history.KeeperHistory()
+    entries = [HistoryEntry(action="", frame=Frame(grid=grid, step=0, level=1)),
+               HistoryEntry(action="RESET", frame=Frame(grid=grid, step=1, level=1))]
+    assert record.sync(entries) == []
+    entries.append(HistoryEntry(action="UP", frame=Frame(grid=_grid(rng, (64, 64), odd_values=False), step=2, level=1)))
+    assert record.sync(entries) == [2]

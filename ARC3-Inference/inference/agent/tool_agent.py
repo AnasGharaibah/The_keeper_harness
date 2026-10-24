@@ -5472,7 +5472,7 @@ class ToolAgent:
                 min_support=keeper.facts_min_support,
                 max_open=keeper.review_max_open,
                 max_hypotheses=keeper.review_max_hypotheses,
-                path=state_path.with_name(f"{state_path.stem}_keeper_facts.json"),
+                path=keeper_guard.artifact_path(state_path, "_keeper_facts.json"),
             )
             self._keeper_memory = memory
             self._keeper_memory_dir = state_path.parent

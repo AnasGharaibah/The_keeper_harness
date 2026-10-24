@@ -101,7 +101,9 @@ class TurnTimer:
 
 
 def timing_path(state_path: Path) -> Path:
-    return state_path.with_name(f"{state_path.stem}_timing.jsonl")
+    from inference.agent.keeper_guard import artifact_path
+
+    return artifact_path(state_path, "_timing.jsonl")
 
 
 @contextmanager
