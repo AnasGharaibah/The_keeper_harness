@@ -452,3 +452,97 @@ def test_checks_run_at_low_priority_and_stop_at_the_per_game_budget(tmp_path, mo
     agent._keeper_before_turn(state_path, "P", lambda *a: None, 900.0)
     (h,) = agent._keeper_memory.hypotheses
     assert ran == [] and h.status == "open"  # budget used: undecided, not dropped
+
+
+# ----- v6: goal facts, game-over reviews, fact use ----------------------------------------------
+
+REACHED_COLUMN_9 = (
+    "def check_transition(t):\n"
+    "    if not t.result.get('level_completed'):\n"
+    "        return None\n"
+    "    return 'P' in t.after_frame.ascii.split('\\n')[6][9:]\n"
+)
+
+
+def _completed_transitions():
+    out = _transitions()
+    out[-1] = {**out[-1], "result": {"board_changed": True, "level_completed": True}}
+    return out
+
+
+def test_completion_reviews_ask_for_a_goal_and_game_over_reviews_ask_what_ended_the_attempt():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    for text in (memory.request_text(3, _transitions(), border=4, max_moves=60),
+                 memory.standalone_text(3, _transitions(), border=4, max_moves=60)):
+        assert '"kind": "goal"' in text and "what finally completed the level" in text and "game over" not in text
+    died = memory.request_text(3, _transitions(), border=4, max_moves=60, reason="game_over")
+    assert "attempt on level 3 just ended in a game over" in died and "what ended the attempt" in died
+    assert '"kind": "goal"' not in died and "completed level" not in died
+    alone = memory.standalone_text(3, _transitions(), border=4, max_moves=60, reason="game_over", reasoning="r")
+    assert alone.startswith("KEEPER LEVEL REVIEW: an attempt on level 3 just ended in a game over.")
+    assert "Board just before the final move" in alone and "just before the game over" in alone
+
+
+def test_a_goal_checked_on_completing_moves_becomes_a_fact_after_two_completions():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    goal = {"text": "the level completes when the player reaches column 9 or more", "kind": "goal",
+            "check_code": REACHED_COLUMN_9}
+    memory.apply(1, _reply("c", [goal]), _completed_transitions(), _check)
+    (h,) = memory.hypotheses
+    assert h.kind == "goal" and h.status == "open" and h.support == 1 and h.falsifiable_seen
+    memory.apply(2, _reply("c2", []), _completed_transitions(), _check)
+    assert h.status == "fact" and h.levels_held == [1, 2]
+    # a goal that only restates "the level completed" can never fail, so it never becomes a fact
+    vague = "def check_transition(t):\n    return True if t.result.get('level_completed') else None\n"
+    report = _check(vague, _completed_transitions(), True)
+    assert report["status"] == "pass" and report["falsifiable"] is False
+
+
+def test_a_game_over_cause_is_kept_apart_and_named_as_such_in_the_notes():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    memory.apply(1, _reply("RIGHT reached the exit", []), _transitions(), _check)
+    summary = memory.apply(2, _reply("ran into the wall", []), _transitions(), _check, reason="game_over")
+    assert summary["reason"] == "game_over" and memory.causes == {1: "RIGHT reached the exit"}
+    assert memory.death_causes == {2: "ran into the wall"}
+    block = memory.notes_block()
+    assert "Level 2, what likely ended the last attempt: ran into the wall" in block and "likely cause" not in block
+
+
+def test_fact_use_records_whether_a_shown_fact_held_and_whether_the_reasoning_repeats_it():
+    memory = keeper_review.KeeperMemory(min_support=2, max_open=10, max_hypotheses=5)
+    fact = "RIGHT moves the player one column until the wall"
+    memory.apply(1, _reply("c", [{"text": fact, "kind": "rule", "check_code": RIGHT_MOVES_PLAYER}]), _transitions(), _check)
+    memory.mark_delivered(memory.notes_block())
+    assert memory.delivered == {"K1": 1}
+    summary = memory.apply(2, _reply("c2", []), _transitions(), _check,
+                           reasoning="The notes say right moves the PLAYER one column, so I press RIGHT.")
+    assert summary["fact_use"] == [{"id": "K1", "shown_after_level": 1, "outcome": "held", "quoted": True}]
+    assert memory.delivered == {}
+    # not shown again: nothing to record
+    assert "fact_use" not in memory.apply(3, _reply("c3", []), _transitions(), _check, reasoning=fact)
+    memory.mark_delivered(memory.notes_block())
+    bad = [dict(t) for t in _transitions()]
+    bad[0]["after"] = board(8, step=1)
+    summary = memory.apply(4, _reply("c4", []), bad, _check, reasoning="I will try UP.")
+    assert summary["fact_use"] == [{"id": "K1", "shown_after_level": 3, "outcome": "demoted", "quoted": False}]
+
+
+def test_game_over_review_runs_once_per_level_and_says_game_over(tmp_path, monkeypatch):
+    from inference.agent.tool_agent import ToolAgent
+
+    monkeypatch.setenv("KEEPER_REVIEW", "1")
+    monkeypatch.setenv("KEEPER_REVIEW_ON_GAME_OVER", "1")
+    calls = []
+    monkeypatch.setattr(ToolAgent, "_chat_completion", _fake_completion(_reply("walked into the wall", []), calls))
+    agent, state_path, game = make_agent(tmp_path)
+    run_code(agent, state_path, "action(['RIGHT', 'RIGHT'])")
+    agent._keeper_review_trigger([{"game_over": True}], None)
+    assert agent._keeper_pending_review == {"level": 1, "reason": "game_over"}
+    prompt = agent._keeper_before_turn(state_path, "GAME OVER PROMPT", lambda *a: None, 900.0)
+    (call,) = calls
+    assert "an attempt on level 1 just ended in a game over" in call["messages"][-1]["content"]
+    assert "Level 1, what likely ended the last attempt: walked into the wall" in prompt
+    # a second death on the same level makes no second request
+    agent._keeper_review_trigger([{"game_over": True}], None)
+    agent._keeper_before_turn(state_path, "AGAIN", lambda *a: None, 900.0)
+    assert len(calls) == 1

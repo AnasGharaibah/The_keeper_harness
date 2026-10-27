@@ -154,6 +154,20 @@ _BOOTSTRAP = textwrap.dedent(
         return pool[(t.after_frame.step * 7) % len(pool)] if pool else None
 
 
+    def _completed_elsewhere(t, transitions):
+        # a goal is judged only on the completing move: keep the completion, take
+        # the board a different move produced; several, since one sample can match
+        if not t.result.get("level_completed"):
+            return []
+        seen = {t.after_frame.ascii}
+        out = []
+        for o in transitions:
+            if o.after_frame.ascii not in seen and len(out) < 20:
+                seen.add(o.after_frame.ascii)
+                out.append(TransitionView(t.action, t.before_frame, o.after_frame, dict(t.result)))
+        return out
+
+
     def _perturbed(t, kind, alt_actions, transitions=()):
         result = dict(t.result)
         action, after = t.action, t.after_frame
@@ -195,17 +209,23 @@ _BOOTSTRAP = textwrap.dedent(
         if perturb:
             applied = [t for t, o in zip(transitions, outcomes) if o is True][:50]
             report["falsifiable"] = False
-            for kind in ("crossed", "frozen", "swapped", "flipped"):
+            for kind in ("crossed", "completed_elsewhere", "frozen", "swapped", "flipped"):
                 for t in applied:
-                    variant = _perturbed(t, kind, alt_actions, transitions)
-                    if variant is None:
-                        continue
-                    try:
-                        if fn(variant) is False:
-                            report["falsifiable"] = True
-                            break
-                    except Exception:
-                        continue
+                    if kind == "completed_elsewhere":
+                        variants = _completed_elsewhere(t, transitions)
+                    else:
+                        variants = [_perturbed(t, kind, alt_actions, transitions)]
+                    for variant in variants:
+                        if variant is None:
+                            continue
+                        try:
+                            if fn(variant) is False:
+                                report["falsifiable"] = True
+                                break
+                        except Exception:
+                            continue
+                    if report["falsifiable"]:
+                        break
                 if report["falsifiable"]:
                     break
         return report

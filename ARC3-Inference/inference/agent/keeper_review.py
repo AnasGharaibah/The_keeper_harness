@@ -29,12 +29,12 @@ CheckRunner = Callable[[str, list[dict[str, Any]], bool], dict[str, Any]]
 NOTES_HEADER = "KEEPER NOTES"
 
 REQUEST_TEMPLATE = """KEEPER LEVEL REVIEW (a harness request: do not call tools, reply with one JSON object only).
-You just completed level {level}. Its moves (border cells ignored):
+{opening} Its moves (border cells ignored):
 {moves}
 {facts}Write:
-(a) "cause": one sentence - what finally completed the level, and which earlier events it needed.
+(a) "cause": one sentence - {cause_ask}
 (b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply.
-{check_api}
+{goal_ask}{check_api}
 Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
 
 # Standalone review (the default): a short request of its own, not the game's
@@ -46,19 +46,36 @@ You receive the level's moves, the first and last boards, and an excerpt of your
 Boards are rows of colour letters: W white, w light gray, g gray, G dark gray, c charcoal, B black, M magenta, P pink, \
 R red, b blue, S sky blue, Y yellow, O orange, r dark red, N green, p purple. Reply with one JSON object only."""
 
-STANDALONE_TEMPLATE = """KEEPER LEVEL REVIEW: level {level} was just completed.
+STANDALONE_TEMPLATE = """KEEPER LEVEL REVIEW: {opening}
 Moves on this level (border cells ignored):
 {moves}
 {surprises}{facts}{ideas}{boards}{reasoning}Write:
-(a) "cause": one sentence - what finally completed the level, and which earlier events it needed.
+(a) "cause": one sentence - {cause_ask}
 (b) "hypotheses": up to {max_hypotheses} rules or goals that explain these moves, especially ones that connect events. Each needs "check_code" defining check_transition(t) that returns False on a move that violates it, True when it holds, None when it does not apply.
-{check_api}
+{goal_ask}{check_api}
 Reply: {{"cause": "...", "hypotheses": [{{"text": "...", "kind": "rule", "check_code": "def check_transition(t):\\n    ..."}}]}}"""
 
 # Prefix review (KEEPER_REVIEW_MODE=prefix): the game's conversation plus this
 # request, sent with the game's own chat-template settings so the cached prompt is
 # reused; thinking therefore stays on and is asked to be brief.
 PREFIX_BRIEF = "Think briefly: a few sentences at most. Then reply with the JSON object only.\n"
+
+# A goal is checked only on the level-completing move, so it is re-checked each
+# time a later level is completed and becomes a fact after two completions.
+GOAL_ASK = ("(c) Make at least one hypothesis a goal (\"kind\": \"goal\"): what was true when the level was completed. "
+            "Its check returns None unless t.result.get('level_completed'), so it can be re-checked on later levels.\n")
+
+# Wording per review trigger: (request opening, standalone opening, cause question,
+# goal request, the last move's name, when the reasoning excerpt ends).
+EVENTS = {
+    "level_completed": ("You just completed level {level}.", "level {level} was just completed.",
+                        "what finally completed the level, and which earlier events it needed.", GOAL_ASK,
+                        "the completing move", "the level was completed"),
+    "game_over": ("Your attempt on level {level} just ended in a game over.",
+                  "an attempt on level {level} just ended in a game over.",
+                  "what ended the attempt, and which earlier moves led to it.", "",
+                  "the final move", "the game over"),
+}
 
 
 def board_text(grid: Any, color_chars: str, *, encoding: str = "runs") -> str:
@@ -272,6 +289,10 @@ def move_lines(transitions: list[dict[str, Any]], *, border: int, max_lines: int
 # ----- memory ----------------------------------------------------------------------------------
 
 
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+
+
 def _held_on(levels: list[int]) -> str:
     levels = sorted(set(levels))
     if len(levels) == 1:
@@ -287,17 +308,25 @@ class KeeperMemory:
         self.path = path
         self.hypotheses: list[Hypothesis] = []
         self.causes: dict[int, str] = {}
+        self.death_causes: dict[int, str] = {}  # game-over reviews: what ended the attempt
+        self.last_reason = "level_completed"
+        self.delivered: dict[str, int] = {}  # fact id -> last reviewed level when the notes showed it
+        self.game_over_levels: set[int] = set()  # levels already reviewed after a game over
         self.reviews: list[dict[str, Any]] = []
         self.last_level: int | None = None
         self._next = 1
 
-    def request_text(self, level: int, transitions: list[dict[str, Any]], *, border: int, max_moves: int, color_chars: str = "") -> str:
+    def request_text(self, level: int, transitions: list[dict[str, Any]], *, border: int, max_moves: int, color_chars: str = "",
+                     reason: str = "level_completed") -> str:
         facts = [h for h in self.hypotheses if h.status == FACT]
         facts_text = ""
         if facts:
             facts_text = "Already verified facts (do not repeat them):\n" + "\n".join(f"- {h.text}" for h in facts[:8]) + "\n"
+        opening, _, cause_ask, goal_ask, _, _ = EVENTS.get(reason, EVENTS["level_completed"])
         return REQUEST_TEMPLATE.format(
-            level=level,
+            opening=opening.format(level=level),
+            cause_ask=cause_ask,
+            goal_ask=goal_ask,
             moves="\n".join(move_lines(transitions, border=border, max_lines=max_moves, color_chars=color_chars)),
             facts=facts_text,
             max_hypotheses=self.max_hypotheses,
@@ -307,10 +336,12 @@ class KeeperMemory:
     def standalone_text(
         self, level: int, transitions: list[dict[str, Any]], *, border: int, max_moves: int, color_chars: str = "",
         surprises: list[str] | None = None, reasoning: str = "", boards: str = "runs", max_surprises: int = 8,
+        reason: str = "level_completed",
     ) -> str:
         """The standalone review request: moves, SURPRISE lines, facts and open ideas
         (so they are not proposed again), the level's first board and the board just
         before the completing move, and an excerpt of the model's own reasoning."""
+        _, opening, cause_ask, goal_ask, last_move, until = EVENTS.get(reason, EVENTS["level_completed"])
         facts = sorted((h for h in self.hypotheses if h.status == FACT), key=lambda h: -h.support)[:8]
         ideas = sorted((h for h in self.hypotheses if h.status == OPEN and not h.reason.startswith("unfalsifiable")),
                        key=lambda h: -h.support)[:5]
@@ -321,11 +352,13 @@ class KeeperMemory:
                    if boards == "runs" else "one colour letter per cell")
             board_block = (
                 f"Boards ({how}).\nFirst board of level {level}:\n{board_text(transitions[0]['before'], color_chars, encoding=boards)}\n"
-                f"Board just before the completing move ({transitions[-1]['action']}):\n"
+                f"Board just before {last_move} ({transitions[-1]['action']}):\n"
                 f"{board_text(transitions[-1]['before'], color_chars, encoding=boards)}\n"
             )
         return STANDALONE_TEMPLATE.format(
-            level=level,
+            opening=opening.format(level=level),
+            cause_ask=cause_ask,
+            goal_ask=goal_ask,
             moves="\n".join(move_lines(transitions, border=border, max_lines=max_moves, color_chars=color_chars)),
             surprises=("SURPRISE lines seen on this level:\n" + "\n".join(f"- {s}" for s in lines) + "\n") if lines else "",
             facts=("Already verified facts (do not repeat them):\n"
@@ -333,7 +366,7 @@ class KeeperMemory:
             ideas=("Ideas already proposed and still unchecked (do not repeat them):\n"
                    + "\n".join(f"- {h.text}" for h in ideas) + "\n") if ideas else "",
             boards=board_block,
-            reasoning=(f"Your own reasoning just before the level was completed (excerpt):\n{reasoning}\n") if reasoning else "",
+            reasoning=(f"Your own reasoning just before {until} (excerpt):\n{reasoning}\n") if reasoning else "",
             max_hypotheses=self.max_hypotheses,
             check_api=CHECK_API,
         )
@@ -389,14 +422,18 @@ class KeeperMemory:
         run_check: CheckRunner,
         *,
         deadline: float | None = None,
+        reason: str = "level_completed",
+        reasoning: str = "",
     ) -> dict[str, Any]:
         """Parse the reply, add new hypotheses, re-check everything open or
         verified on this level's transitions, and decide each status."""
         parsed = parse_reply(reply_text)
         summary: dict[str, Any] = {"level": level, "truncated": parsed["truncated"], "proposed": [],
                                    "promoted": [], "refuted": [], "demoted": [], "dropped": [], "skipped_checks": 0}
+        if reason == "game_over":
+            summary["reason"] = reason
         if parsed["cause"]:
-            self.causes[level] = parsed["cause"]
+            (self.death_causes if reason == "game_over" else self.causes)[level] = parsed["cause"]
             summary["cause"] = parsed["cause"]
         known = {h.text.lower() for h in self.hypotheses}
         for item in parsed["hypotheses"][: self.max_hypotheses]:
@@ -414,7 +451,9 @@ class KeeperMemory:
                 continue
             self._decide(hypothesis, level, transitions, run_check, summary)
         self._enforce_open_cap(summary)
-        self.last_level = level
+        if self.delivered:
+            summary["fact_use"] = self._fact_use(level, summary, reasoning)
+        self.last_level, self.last_reason = level, reason
         self.reviews.append(summary)
         self.save()
         return summary
@@ -454,6 +493,30 @@ class KeeperMemory:
         else:
             h.reason = f"support {h.support} < {self.min_support}"
 
+    def mark_delivered(self, block: str) -> None:
+        """Remember which facts the notes block just put in front of the model."""
+        for h in self.hypotheses:
+            if h.status == FACT and f": {h.text} (support {h.support})" in block:
+                self.delivered.setdefault(h.id, self.last_level or 0)
+
+    def _fact_use(self, level: int, summary: dict[str, Any], reasoning: str) -> list[dict[str, Any]]:
+        """For each fact shown since the last review: did it hold on this level's
+        moves, and does the model's reasoning repeat it (5 words in a row)."""
+        said = " " + " ".join(_words(reasoning)) + " "
+        by_id = {h.id: h for h in self.hypotheses}
+        out = []
+        for hid, shown_after in self.delivered.items():
+            h = by_id.get(hid)
+            if h is None:
+                continue
+            outcome = "demoted" if hid in summary["demoted"] else "held" if level in h.levels_held else "did not apply"
+            words = _words(h.text)
+            grams = [words[i : i + 5] for i in range(max(1, len(words) - 4))]
+            quoted = any(f" {' '.join(g)} " in said for g in grams if g)
+            out.append({"id": hid, "shown_after_level": shown_after, "outcome": outcome, "quoted": quoted})
+        self.delivered = {}
+        return out
+
     def _enforce_open_cap(self, summary: dict[str, Any]) -> None:
         if self.max_open <= 0:
             return
@@ -473,9 +536,14 @@ class KeeperMemory:
         if facts:
             lines.append("Verified on your recorded moves (each held on the levels named; a new level can break it):")
             lines += [f"- {_held_on(h.levels_held)}: {h.text} (support {h.support})" for h in facts]
-        cause = self.causes.get(self.last_level)
-        if cause:
-            lines.append(f"Level {self.last_level}, likely cause: {cause}")
+        if self.last_reason == "game_over":
+            cause = self.death_causes.get(self.last_level)
+            if cause:
+                lines.append(f"Level {self.last_level}, what likely ended the last attempt: {cause}")
+        else:
+            cause = self.causes.get(self.last_level)
+            if cause:
+                lines.append(f"Level {self.last_level}, likely cause: {cause}")
         if len(lines) == 1:
             return ""
         # Over the limit: leave out the lowest-support facts rather than cutting text.
@@ -492,6 +560,7 @@ class KeeperMemory:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps({"hypotheses": [asdict(h) for h in self.hypotheses],
-                                             "causes": self.causes, "reviews": self.reviews}, indent=2, default=str))
+                                             "causes": self.causes,
+                                             "death_causes": self.death_causes, "reviews": self.reviews}, indent=2, default=str))
         except OSError:
             pass

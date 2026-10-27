@@ -3483,6 +3483,8 @@ _KEEPER_REVIEW_BUDGET_MARGIN_SECONDS = 60.0
 # A review that is still running this long after its budget has hung; it is
 # abandoned so it can never hold the game's priority slot.
 _KEEPER_REVIEW_HARD_MARGIN_SECONDS = 120.0
+# How much of the model's recent reasoning the fact-use record searches for a shown fact.
+_KEEPER_FACT_USE_REASONING_CHARS = 50_000
 
 
 def _note_first_data_line(lines, probe: dict[str, float]):
@@ -5525,6 +5527,12 @@ class ToolAgent:
             memory = self._keeper_memory_for(state_path)
             pending = getattr(self, "_keeper_pending_review", None)
             fresh = False
+            if pending is not None and pending.get("reason") == "game_over":
+                # one game-over review per level: deaths repeat, and each review is a model call
+                if int(pending["level"]) in memory.game_over_levels:
+                    self._keeper_pending_review = pending = None
+                else:
+                    memory.game_over_levels.add(int(pending["level"]))
             if pending is not None:
                 self._keeper_pending_review = None
                 skip = self._keeper_review_skip_reason(request_timeout_seconds)
@@ -5534,7 +5542,8 @@ class ToolAgent:
                     memory.reviews.append({"level": pending["level"], "skipped": skip})
                     memory.save()
                 else:
-                    self._keeper_review(state_path, memory, int(pending["level"]), append_transcript, request_timeout_seconds)
+                    self._keeper_review(state_path, memory, int(pending["level"]), append_transcript, request_timeout_seconds,
+                                        reason=str(pending.get("reason") or "level_completed"))
                     fresh = True
             block = memory.notes_block()
             if not block:
@@ -5556,6 +5565,7 @@ class ToolAgent:
             # there anyway, so re-adding it costs no extra prefill).
             if fresh or not delivered:
                 self._keeper_block = block
+                memory.mark_delivered(block)
                 timer = getattr(self, "_keeper_timer", None)
                 if timer is not None:
                     timer.add_chars("notes", block)
@@ -5564,7 +5574,7 @@ class ToolAgent:
 
     def _keeper_review(
         self, state_path: Path, memory: keeper_review.KeeperMemory, level: int, append_transcript,
-        request_timeout_seconds: float | None,
+        request_timeout_seconds: float | None, reason: str = "level_completed",
     ) -> None:
         keeper = self._keeper
         started = time.monotonic()
@@ -5588,7 +5598,8 @@ class ToolAgent:
         #   reasoning-effort line only when thinking is on) and re-processes it all.
         if keeper.review_mode == "prefix":
             request = keeper_review.PREFIX_BRIEF + memory.request_text(
-                level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS
+                level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS,
+                reason=reason,
             )
             messages = [{"role": "system", "content": self._system_prompt}, *self._history_messages,
                         {"role": "user", "content": request}]
@@ -5599,7 +5610,7 @@ class ToolAgent:
                 level, transitions, border=keeper.border, max_moves=keeper.review_max_moves, color_chars=ARC_COLOR_CHARS,
                 surprises=(getattr(self, "_keeper_surprise_log", None) or {}).get(level, []),
                 reasoning=self._keeper_recent_reasoning(keeper.review_reasoning_chars),
-                boards=keeper.review_boards, max_surprises=keeper.review_max_surprises,
+                boards=keeper.review_boards, max_surprises=keeper.review_max_surprises, reason=reason,
             )
             messages = [{"role": "system", "content": keeper_review.REVIEWER_SYSTEM}, {"role": "user", "content": request}]
             request_kwargs = {"tools": None, "max_tokens": keeper.review_max_tokens, "enable_thinking": False}
@@ -5635,7 +5646,9 @@ class ToolAgent:
             memory.check_seconds = spent + float(report.get("seconds") or keeper.review_check_timeout_seconds)
             return report
 
-        summary = memory.apply(level, reply, transitions, check, deadline=deadline)
+        # fact use: does the model's reasoning since the notes repeat a shown fact
+        summary = memory.apply(level, reply, transitions, check, deadline=deadline, reason=reason,
+                               reasoning=self._keeper_recent_reasoning(_KEEPER_FACT_USE_REASONING_CHARS) if memory.delivered else "")
         crashed = memory.crashed(summary)
         remaining = deadline - time.monotonic()
         if crashed and remaining > 5:
@@ -5794,9 +5807,10 @@ class ToolAgent:
             ),
             None,
         )
+        level = current_frame.level if current_frame is not None else 1
         if ended == "level_completed" or (ended == "game_over" and keeper.review_on_game_over):
             self._keeper_pending_review = {
-                "level": current_frame.level if current_frame is not None else 1,
+                "level": level,
                 "reason": ended,
             }
 
