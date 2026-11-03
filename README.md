@@ -1,6 +1,6 @@
 # Keeper: falsification-gated memory for ARC-AGI-3 agents
 
-**Team PSUT MindX**: Anas Gharaibah, Tuleen Bakir, Omar Abdel Rahem
+**Team PSUT MindX**: Anas Gharaibah, Tuleen Bakir, Omar Abdel Rahem, Yazan Abu Baker
 Princess Sumaya University for Technology (PSUT), Amman, Jordan
 
 Our entry for the Kaggle competition [ARC Prize 2026: ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3) and the [ARC Prize 2026 Paper Track](https://www.kaggle.com/competitions/arc-prize-2026-paper-track). It was our first Kaggle competition.
