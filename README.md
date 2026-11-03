@@ -5,7 +5,7 @@ Princess Sumaya University for Technology (PSUT), Amman, Jordan
 
 Our entry for the Kaggle competition [ARC Prize 2026: ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3) and the [ARC Prize 2026 Paper Track](https://www.kaggle.com/competitions/arc-prize-2026-paper-track). It was our first Kaggle competition.
 
-**Best public LB score: 32.56** (submission 57716708, notebook `f3-s9-keeper-v6`).
+**Best public LB score: 32.56** (submission 57716708, notebook [`f3-s9-keeper-v6`](https://www.kaggle.com/code/anasgharaibah/f3-s9-keeper-v6)). Every notebook in the results table below is public on Kaggle.
 
 > **Branches.** This is `main`: our earlier Keeper v1/v2 work on Tufa Labs' Duck harness (its old README is [docs/KEEPER_V2_README.md](docs/KEEPER_V2_README.md)). The code behind the 32.56 score, and every file linked below, is on the [`keeper-v6`](https://github.com/AnasGharaibah/The_keeper_harness/tree/keeper-v6) branch.
 
@@ -18,7 +18,7 @@ ARC-AGI-3 games come with no instructions: the agent has to work out the rules a
 **Keeper lets the agent keep a belief only after the belief has survived a test against the moves it actually played.** It is a set of optional layers on top of [Daniel Franzen's Milestone 2 solution](https://github.com/da-fr/arc-agi-3-solution), which is built on [Tufa Labs' Duck harness](https://github.com/Tufalabs/duck-harness). Every layer is an environment switch, and with all of them off the code behaves like Franzen's baseline.
 
 | Switch | File | What it does |
-| --- | --- | --- |
+| --- | --- | --- | --- |
 | `KEEPER_SURPRISE` | `keeper_auto.py` | Tells the model when a move did something it did not expect. |
 | `KEEPER_PERCEPTION` | `keeper_perception.py` | Reports object roles, rotations and shape matches that a plain frame diff misses. |
 | `KEEPER_REVIEW` | `keeper_review.py`, `keeper_check_sandbox.py` | After each level (and after a game over), one model call proposes rules and goals as small Python checks. A sandbox runs each check on the recorded moves. Only checks that pass become pinned facts, shown to the model as `KEEPER NOTES`. |
@@ -41,21 +41,21 @@ All Keeper code is in [`ARC3-Inference/inference/agent/keeper_*.py`](https://git
 
 The public leaderboard scores runs on hidden games. Each team can submit once per day.
 
-| Submission | What | Public LB |
-| --- | --- | --- |
-| 57716708 | **F3**: Keeper v6 + S9 layers | **32.56** |
-| 57892002 | F3 rerun 2 (same notebook) | 31.39 |
-| 57565176 | F2: Franzen + D' scheduler, Keeper off | 29.04 |
-| 57460716 | Keeper v3 notebook, Keeper off | 28.74 |
-| 57786009 | F3.1: F3 on Keeper v6.1 | 26.93 |
-| 57676562 | F2K2-D: Keeper v5 + run deadline | 26.32 |
-| 57751962 | **F3-off**: the F3 notebook with every `KEEPER_*` switch off | 25.63 |
-| 57854361 | F3 rerun 1 (same notebook) | 24.91 |
-| 57823468 | F3-guard: F3 + no-op repeat guard | 24.17 |
-| 57692322 | F2K3: Keeper v6 without S9 | 20.91 |
-| 57415945 | Keeper v2 (Duck harness) | 1.11 |
-| 56853156 | Omar's hybrid council search | 0.11 |
-| 57501713, 57579040, 57610610 | Keeper v3 (d), v4, F2K2: overran the hidden time limit | 0.00 |
+| Submission | What | Public LB | Notebook |
+| --- | --- | --- | --- |
+| 57716708 | **F3**: Keeper v6 + S9 layers | **32.56** | [f3-s9-keeper-v6](https://www.kaggle.com/code/anasgharaibah/f3-s9-keeper-v6) v1 |
+| 57892002 | F3 rerun 2 (same notebook) | 31.39 | [f3-s9-keeper-v6](https://www.kaggle.com/code/anasgharaibah/f3-s9-keeper-v6) v2 |
+| 57565176 | F2: Franzen + D' scheduler, Keeper off | 29.04 | [f2-franzen-gateway-dprime](https://www.kaggle.com/code/tuleenbakir/f2-franzen-gateway-dprime) |
+| 57460716 | Keeper v3 notebook, Keeper off | 28.74 | [keeper-v3-a-baseline](https://www.kaggle.com/code/anasgharaibah/keeper-v3-a-baseline) |
+| 57786009 | F3.1: F3 on Keeper v6.1 | 26.93 | [f3-1-keeper-v6-1](https://www.kaggle.com/code/anasgharaibah/f3-1-keeper-v6-1) |
+| 57676562 | F2K2-D: Keeper v5 + run deadline | 26.32 | [f2k2-d-rerun-deadline](https://www.kaggle.com/code/anasgharaibah/f2k2-d-rerun-deadline) |
+| 57751962 | **F3-off**: the F3 notebook with every `KEEPER_*` switch off | 25.63 | [f3-off-s9-no-keeper](https://www.kaggle.com/code/anasgharaibah/f3-off-s9-no-keeper) |
+| 57854361 | F3 rerun 1 (same notebook) | 24.91 | [f3-s9-keeper-v6](https://www.kaggle.com/code/anasgharaibah/f3-s9-keeper-v6) v2 |
+| 57823468 | F3-guard: F3 + no-op repeat guard | 24.17 | [f3-guard](https://www.kaggle.com/code/anasgharaibah/f3-guard) |
+| 57692322 | F2K3: Keeper v6 without S9 | 20.91 | [f2k3-keeper-v6](https://www.kaggle.com/code/anasgharaibah/f2k3-keeper-v6) |
+| 57415945 | Keeper v2 (Duck harness) | 1.11 | [keeper-v2-20261020](https://www.kaggle.com/code/anasgharaibah/keeper-v2-20261020) |
+| 56853156 | Omar's hybrid council search | 0.11 | Omar's account |
+| 57501713, 57579040, 57610610 | Keeper v3 (d), v4, F2K2: overran the hidden time limit | 0.00 | [keeper-v3-d-all](https://www.kaggle.com/code/anasgharaibah/keeper-v3-d-all), [f2k-franzen-gateway-dprime-keeper](https://www.kaggle.com/code/tuleenbakir/f2k-franzen-gateway-dprime-keeper), [f2k2-franzen-gateway-dprime-keeper](https://www.kaggle.com/code/anasgharaibah/f2k2-franzen-gateway-dprime-keeper) |
 
 **What we learned from these numbers:**
 
