@@ -1,58 +1,96 @@
-# ARC-AGI-3: Daniel Franzen's Milestone 2 solution
+# Keeper: falsification-gated memory for ARC-AGI-3 agents
 
-This repository contains my solution for the **ARC-AGI-3 Progress Prize #2**. **For a detailed explanation of the approach, changes, and experiments, see the [write-up](WRITEUP.md).**
+**Team PSUT MindX**: Anas Gharaibah, Tuleen Bakir, Omar Abdel Rahem
+Princess Sumaya University for Technology (PSUT), Amman, Jordan
 
-My approach is based on [Tufa Labs' Duck harness](https://github.com/Tufalabs/duck-harness). Full credit to **Jeroen Cottaar and Tufa Labs** for the original solver, harness, and notebook.
+Our entry for the Kaggle competition [ARC Prize 2026: ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3) and the [ARC Prize 2026 Paper Track](https://www.kaggle.com/competitions/arc-prize-2026-paper-track). It was our first Kaggle competition.
 
-My changes focus on getting more useful work from the model within the competition's compute budget: faster inference with a larger context, better prefix-cache retention, adaptive compute allocation across games, and improvements to the information and tools available to the agent.
+**Best public LB score: 32.56** (submission 57716708, notebook `f3-s9-keeper-v6`).
 
-## Reproducing the solution
+> **Branches.** `keeper-v6` holds the code behind the 32.56 score. `main` holds our earlier Keeper v1/v2 work on Tufa Labs' Duck harness.
 
-The [competition notebook](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution) is the intended reproduction path. It includes the harness patch and sets up the model and offline serving runtime on Kaggle. When copying it, select the **RTX Pro 6000** GPU manually.
+---
 
-The fork is based on upstream commit [`7652836`](https://github.com/Tufalabs/duck-harness/tree/7652836056c59e044f093e3c13ed7438c814169e). The source here includes both the features used in the submission and optional experiments. The published notebook's settings identify the competition configuration; enabling every option is not the intended setup.
+## What Keeper is
 
-For local use and development, see the [harness README](ARC3-Inference/README.md). The checked-in local configuration and Tufa deployment commands are separate from the competition notebook's serving setup.
+ARC-AGI-3 games come with no instructions: the agent has to work out the rules and the goal by playing. A language-model agent forms beliefs about the game ("the blue block pushes the red one", "the goal is to fill the frame"), and wrong beliefs stay in its context and mislead it level after level.
 
-For building the offline SGLang runtime and details of the serving patches, see the [serving README](serving/README.md).
+**Keeper lets the agent keep a belief only after the belief has survived a test against the moves it actually played.** It is a set of optional layers on top of [Daniel Franzen's Milestone 2 solution](https://github.com/da-fr/arc-agi-3-solution), which is built on [Tufa Labs' Duck harness](https://github.com/Tufalabs/duck-harness). Every layer is an environment switch, and with all of them off the code behaves like Franzen's baseline.
 
-## Main changes
+| Switch | File | What it does |
+| --- | --- | --- |
+| `KEEPER_SURPRISE` | `keeper_auto.py` | Tells the model when a move did something it did not expect. |
+| `KEEPER_PERCEPTION` | `keeper_perception.py` | Reports object roles, rotations and shape matches that a plain frame diff misses. |
+| `KEEPER_REVIEW` | `keeper_review.py`, `keeper_check_sandbox.py` | After each level (and after a game over), one model call proposes rules and goals as small Python checks. A sandbox runs each check on the recorded moves. Only checks that pass become pinned facts, shown to the model as `KEEPER NOTES`. |
+| fail-safe | `keeper_guard.py`, `keeper_resources.py` | If a Keeper hook crashes, times out or uses too much memory, Keeper switches itself off for that game. The run itself never dies. |
+| run deadline | notebook | A soft deadline at 8h40 makes sure the hidden rerun always finishes inside Kaggle's time limit. |
 
-- **Model and serving:** Qwen3.8-Flash-Next with an optimized SGLang runtime. Serving work makes long contexts practical while maintaining throughput, including changes to Mamba prefix-cache retention and checkpoint prefetching.
-- **Context management:** calibrated text-token estimates, image-size-aware token accounting, and blockwise history trimming. Evicting a larger block at once lets the retained prefix be reused for more requests before the next trim.
-- **Compute allocation:** bounded concurrent admission reduces cache pressure. Priority scheduling allocates compute using current progress, actions and tokens spent, and continuation value. Cached continuations receive priority; tail fade shifts emphasis toward immediate level completions near the deadline.
-- **Perception and feedback:** larger board images, board-difference and death images, animation frames and timelines accessible in Python, and clearer action-result history.
-- **Agent tools and prompts:** executable undo, optional reset, guidance for transferring knowledge across levels, and retention of eligible Python functions and supported imports.
-- **Execution safeguards:** guards for stale-state actions and no-op batches, protection at level boundaries, and clearer tool output with action echo and optional middle truncation.
+All Keeper code is in [`ARC3-Inference/inference/agent/keeper_*.py`](ARC3-Inference/inference/agent/), and its tests are in `ARC3-Inference/tests/test_keeper_*.py`.
 
-- **Makefile compatibility:** fixes for newer GNU Make versions, including how configuration-derived variables are evaluated.
-- **Viewer fixes and improvements:** correct per-turn transcript display, visibility of retried attempts, clearer handling of pending transcripts and the latest board state, and per-step token-usage information.
+```
+ game frame ──► agent (Qwen, Python tool) ──► action ──► game
+                    ▲                            │
+       KEEPER NOTES │                            ▼
+   (passed checks)  │                   recorded moves
+                    │                            │
+               fact store ◄── sandbox test ◄── review call proposes rules
+                              (fail = dropped)
+```
 
-The detailed option reference is available in the [configuration guide](ARC3-Inference/CONFIGURATION.md). The [write-up](WRITEUP.md) distinguishes features used in the competition from experiments with negative or inconclusive results.
+## Results
 
-## Repository layout
+The public leaderboard scores runs on hidden games. Each team can submit once per day.
 
-| Path | Contents |
-| --- | --- |
-| [ARC3-Inference/](ARC3-Inference/) | Modified solver, prompts, tools, scheduler, diagnostics, and viewer. |
-| [serving/](serving/) | Offline SGLang wheelhouse builder, custom patches, and build instructions. |
-| [tufa-arc-agi-framework/](tufa-arc-agi-framework/) | Tufa's bundled game execution framework. |
-| [taaf-duck-harness-kaggle-share.ipynb](taaf-duck-harness-kaggle-share.ipynb) | Tufa's original bundled notebook; see the competition notebook above for this solution. |
+| Submission | What | Public LB |
+| --- | --- | --- |
+| 57716708 | **F3**: Keeper v6 + S9 layers | **32.56** |
+| 57892002 | F3 rerun 2 (same notebook) | 31.39 |
+| 57565176 | F2: Franzen + D' scheduler, Keeper off | 29.04 |
+| 57460716 | Keeper v3 notebook, Keeper off | 28.74 |
+| 57786009 | F3.1: F3 on Keeper v6.1 | 26.93 |
+| 57676562 | F2K2-D: Keeper v5 + run deadline | 26.32 |
+| 57751962 | **F3-off**: the F3 notebook with every `KEEPER_*` switch off | 25.63 |
+| 57854361 | F3 rerun 1 (same notebook) | 24.91 |
+| 57823468 | F3-guard: F3 + no-op repeat guard | 24.17 |
+| 57692322 | F2K3: Keeper v6 without S9 | 20.91 |
+| 57415945 | Keeper v2 (Duck harness) | 1.11 |
+| 56853156 | Omar's hybrid council search | 0.11 |
+| 57501713, 57579040, 57610610 | Keeper v3 (d), v4, F2K2: overran the hidden time limit | 0.00 |
 
-## Inspect a saved run
+**What we learned from these numbers:**
 
-The viewer does not require a model server or GPU. From the repository root, with `uv` installed:
+- **Ablation.** The same notebook scored 32.56 with Keeper on and 25.63 with Keeper off. That is a one-run comparison, so it is a hint, not proof.
+- **Noise is large.** The F3 notebook scored 32.56, 24.91 and 31.39 on three identical submissions (mean 29.6). On Franzen's own notebook, others see about 27.6-31.5 from run to run. One submission cannot show a 1-3 point difference.
+- **Our 0.00 runs** came from Keeper slowing the agent until the hidden rerun ran out of time. The 8h40 soft deadline fixed this, and every later Keeper run finished.
+- **Short checks do not predict LB scores.** F3's 20-minute check scored 1.62.
+
+## Reproduce
+
+The intended path is the Kaggle notebook **[f3-s9-keeper-v6](https://www.kaggle.com/code/anasgharaibah/f3-s9-keeper-v6)**. It installs this branch's harness patch, adds the S9 layers, and sets the Keeper switches. Run it on an **RTX Pro 6000** GPU.
+
+To run the Keeper unit tests locally:
 
 ```bash
 cd ARC3-Inference
-uv sync --locked
-make view VIEW_RUN_DIR=/path/to/your/run VIEW_PORT=8011
+python -m pytest tests/test_keeper_*.py
 ```
 
-Open `http://127.0.0.1:8011` to inspect the saved run's boards, actions, and model transcripts.
+For local runs of the harness, see the [harness README](ARC3-Inference/README.md) and the [configuration guide](ARC3-Inference/CONFIGURATION.md). Franzen's original README is kept as [docs/FRANZEN_README.md](docs/FRANZEN_README.md).
 
-## Acknowledgements
+## Paper
 
-This work builds on Tufa's [Duck harness](https://github.com/Tufalabs/duck-harness) and [technical write-up](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion/717133), the Qwen models, and the SGLang serving framework.
+Our Paper Track write-up, *Keeper: falsification-gated memory for ARC-AGI-3 agents*, will be linked here when it is published (due 9 November 2026). [docs/KEEPER_REPORT.md](docs/KEEPER_REPORT.md) is our longer internal report (written 22 Oct, at Keeper v3).
 
-The serving setup also builds on work by [John Pezzulli (Pennyroyal)](https://github.com/jpezzulli/sglang-rtxpro6000), [Mamy Ratsimbazafy](https://github.com/mratsim/sglang-qwen38fn-sm120-turbo), and [Gabriel Olympie](https://github.com/gabrielolympie/sglang-flashnext-sm120), with model quantizations from RadixArk and Intel. Exact checkpoints, runtime versions, and patches are recorded in the competition notebook and its build scripts.
+## Credits
+
+Keeper (the `keeper_*` modules, their tests and the notebook wiring) is our work. Everything else belongs to its original authors:
+
+- **Daniel Franzen**: the [Milestone 2 solution](https://github.com/da-fr/arc-agi-3-solution) this repository forks ([write-up](WRITEUP.md)).
+- **Jeroen Cottaar and Tufa Labs**: the [Duck harness](https://github.com/Tufalabs/duck-harness) and TAAF.
+- **ondrewsha**: the HF fixes, RESETC, H3v2.1 audit and H1 solved-level memory from the public notebook [ARC-AGI-3 stack S9](https://www.kaggle.com/code/ondrewsha/arc-agi-3-stack-s9), used verbatim in F3.
+- **shiiin9** ([Affectify](https://www.kaggle.com/code/shiiin9/affectify-arc-31-54-in-a-single-sub)) for the D' scheduler formula and **tantan0327** ([arc3-franzen-dprime](https://www.kaggle.com/code/tantan0327/arc3-franzen-dprime)) for its implementation.
+- **Qwen team**: the language model.
+
+## License
+
+[Apache License 2.0](LICENSE), the same as the upstream code. Third-party code and model weights keep their own licenses.
